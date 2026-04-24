@@ -1,0 +1,2 @@
+[console_scripts]
+kosu = kosu_tracker.cli:main

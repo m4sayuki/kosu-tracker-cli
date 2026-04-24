@@ -1,0 +1,96 @@
+Metadata-Version: 2.4
+Name: kosu-tracker-cli
+Version: 0.1.0
+Summary: CLI tool for background worklog collection and daily effort summaries on macOS
+Author: OpenAI Codex
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+
+# kosu-tracker-cli
+
+macOS 上でバックグラウンド動作し、1分ごとに利用中アプリ情報を JSONL へ記録して、当日の工数っぽい集計を返す CLI ツールです。
+
+## できること
+
+- フロントのアプリ名とウィンドウタイトルを 1 分ごとに収集
+- ブラウザ利用時は可能な範囲でタブタイトルと URL を収集
+- 日別のログを `~/.local/share/kosu-tracker/logs/YYYY-MM-DD.jsonl` に保存
+- `report today` でアプリ別・カテゴリ別の利用時間を推定
+- `--with-ai` を付けると OpenAI API を使って日本語サマリを生成
+
+## 注意点
+
+- 対応 OS は macOS です
+- 初回実行時に `System Events` や各ブラウザへの Automation / Accessibility 権限が必要です
+- Firefox は AppleScript で URL 取得が難しいため、ブラウザ名中心の記録になります
+- このツールは 1 分ごとのサンプリングなので、厳密な打刻ではなく「推定工数」です
+- 保存先を変えたい場合は `KOSU_TRACKER_HOME=/path/to/data` を指定できます
+
+## セットアップ
+
+```bash
+cd ~/workspace/kosu-tracker-cli
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+## 使い方
+
+1. バックグラウンド収集を開始
+
+```bash
+kosu start
+```
+
+2. 状態確認
+
+```bash
+kosu status
+```
+
+3. 単発サンプル確認
+
+```bash
+kosu sample --json
+```
+
+4. 今日の集計を表示
+
+```bash
+kosu report today
+```
+
+5. AI 要約付きで表示
+
+```bash
+export OPENAI_API_KEY=...
+kosu report today --with-ai
+```
+
+6. 停止
+
+```bash
+kosu stop
+```
+
+## ログ形式
+
+```json
+{
+  "timestamp": "2026-04-23T09:00:00+09:00",
+  "app_name": "Google Chrome",
+  "window_title": "GitHub - pull request",
+  "category": "research",
+  "browser_title": "GitHub - pull request",
+  "browser_url": "https://github.com/example/repo/pull/1",
+  "browser_domain": "github.com"
+}
+```
+
+## 今後の拡張候補
+
+- `launchd` plist を生成してログイン時自動起動
+- 連続サンプルをマージしてセッション単位の分析を強化
+- Slack や会議系アプリの詳細カテゴリ分け
+- CSV / Markdown / 日報出力
