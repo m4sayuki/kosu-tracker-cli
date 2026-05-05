@@ -30,6 +30,7 @@ KNOWN_BROWSERS = {
     "Microsoft Edge",
     "Firefox",
 }
+MONITOR_COMMAND_MARKERS = ("kosu_tracker.cli", "run-monitor")
 
 
 @dataclass
@@ -234,6 +235,28 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
+def get_pid_command(pid: int) -> str | None:
+    completed = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None
+    command = completed.stdout.strip()
+    return command or None
+
+
+def is_monitor_pid_running(pid: int) -> bool:
+    if not is_pid_running(pid):
+        return False
+    command = get_pid_command(pid)
+    if command is None:
+        return False
+    return all(marker in command for marker in MONITOR_COMMAND_MARKERS)
+
+
 def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
@@ -245,7 +268,7 @@ def read_pid() -> int | None:
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_pid_running(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
@@ -273,7 +296,7 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid or not is_monitor_pid_running(pid):
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
@@ -289,7 +312,7 @@ def stop_monitor() -> None:
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_pid_running(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
