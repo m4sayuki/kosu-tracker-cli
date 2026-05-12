@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import textwrap
 import time
 import urllib.error
@@ -207,20 +208,19 @@ def collect_sample() -> ActivitySample:
 def monitor_loop(interval_seconds: int) -> None:
     ensure_dirs()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
-    keep_running = True
+    stop_requested = threading.Event()
 
     def handle_term(signum: int, frame: Any) -> None:
-        nonlocal keep_running
-        keep_running = False
+        stop_requested.set()
 
     signal.signal(signal.SIGTERM, handle_term)
     signal.signal(signal.SIGINT, handle_term)
     try:
-        while keep_running:
+        while not stop_requested.is_set():
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
-            time.sleep(interval_seconds)
+            stop_requested.wait(interval_seconds)
     finally:
         if PID_FILE.exists():
             PID_FILE.unlink()
@@ -282,6 +282,8 @@ def stop_monitor() -> None:
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
+    if is_pid_running(pid):
+        raise SystemExit(f"monitor did not stop after SIGTERM (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
     print(f"stopped monitor (pid={pid})")
