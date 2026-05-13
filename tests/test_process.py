@@ -1,12 +1,13 @@
 """Tests for read_pid, is_pid_running, require_not_running."""
 from __future__ import annotations
 
+import fcntl
 import os
 
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import is_pid_running, read_pid, require_not_running, start_monitor
 
 
 @pytest.fixture(autouse=True)
@@ -16,6 +17,7 @@ def patch_state_dir(tmp_path, monkeypatch):
     pid_file = state_dir / "monitor.pid"
     monkeypatch.setattr(cli_module, "STATE_DIR", state_dir)
     monkeypatch.setattr(cli_module, "PID_FILE", pid_file)
+    monkeypatch.setattr(cli_module, "START_LOCK_FILE", state_dir / "monitor.start.lock")
     return pid_file
 
 
@@ -74,3 +76,18 @@ class TestRequireNotRunning:
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+
+class TestStartMonitor:
+    def test_start_lock_prevents_concurrent_start(self, mocker):
+        lock_file = cli_module.START_LOCK_FILE.open("w", encoding="utf-8")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        popen = mocker.patch("kosu_tracker.cli.subprocess.Popen")
+        try:
+            with pytest.raises(SystemExit, match="already in progress"):
+                start_monitor(interval_seconds=60)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
+
+        popen.assert_not_called()
