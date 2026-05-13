@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import signal
@@ -11,10 +12,11 @@ import time
 import urllib.error
 import urllib.request
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 APP_DIR = Path(os.environ.get("KOSU_TRACKER_HOME", Path.home() / ".local" / "share" / "kosu-tracker")).expanduser()
@@ -22,6 +24,7 @@ LOG_DIR = APP_DIR / "logs"
 STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
 LATEST_FILE = STATE_DIR / "latest.json"
+START_LOCK_FILE = STATE_DIR / "monitor.start.lock"
 KNOWN_BROWSERS = {
     "Google Chrome",
     "Safari",
@@ -59,6 +62,35 @@ class ActivitySample:
 def ensure_dirs() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+@contextmanager
+def start_lock() -> Iterator[None]:
+    lock_file = START_LOCK_FILE.open("w", encoding="utf-8")
+    locked = False
+    try:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SystemExit("monitor start is already in progress") from exc
+        locked = True
+        yield
+    finally:
+        try:
+            if locked:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_file.close()
 
 
 def run_osascript(script: str) -> str:
@@ -253,20 +285,23 @@ def require_not_running() -> None:
 
 def start_monitor(interval_seconds: int) -> None:
     ensure_dirs()
-    require_not_running()
-    env = os.environ.copy()
-    subprocess.Popen(
-        [sys.executable, "-m", "kosu_tracker.cli", "run-monitor", "--interval", str(interval_seconds)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        env=env,
-    )
-    time.sleep(1)
-    pid = read_pid()
-    if not pid:
-        raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
+    with start_lock():
+        require_not_running()
+        env = os.environ.copy()
+        subprocess.Popen(
+            [sys.executable, "-m", "kosu_tracker.cli", "run-monitor", "--interval", str(interval_seconds)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+        time.sleep(1)
+        pid = read_pid()
+        if not pid or not is_pid_running(pid):
+            if PID_FILE.exists():
+                PID_FILE.unlink()
+            raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
     print(f"started monitor (pid={pid})")
     print(f"log directory: {LOG_DIR}")
 
@@ -433,7 +468,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     start = sub.add_parser("start", help="Start the background monitor")
-    start.add_argument("--interval", type=int, default=60, help="Sampling interval in seconds")
+    start.add_argument("--interval", type=positive_int, default=60, help="Sampling interval in seconds")
 
     sub.add_parser("stop", help="Stop the background monitor")
     sub.add_parser("status", help="Show monitor status")
@@ -442,13 +477,13 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--json", action="store_true", help="Print JSON only")
 
     run_monitor = sub.add_parser("run-monitor", help=argparse.SUPPRESS)
-    run_monitor.add_argument("--interval", type=int, default=60)
+    run_monitor.add_argument("--interval", type=positive_int, default=60)
 
     report = sub.add_parser("report", help="Summarize one day of logs")
     report.add_argument("target_date", nargs="?", default="today", help="today, yesterday, or YYYY-MM-DD")
     report.add_argument("--with-ai", action="store_true", help="Request an OpenAI summary")
     report.add_argument("--model", default="gpt-5-mini", help="OpenAI model used for --with-ai")
-    report.add_argument("--interval-minutes", type=int, default=1, help="Minutes per sample")
+    report.add_argument("--interval-minutes", type=positive_int, default=1, help="Minutes per sample")
 
     return parser
 
