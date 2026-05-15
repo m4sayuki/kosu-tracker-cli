@@ -14,7 +14,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 APP_DIR = Path(os.environ.get("KOSU_TRACKER_HOME", Path.home() / ".local" / "share" / "kosu-tracker")).expanduser()
@@ -22,6 +22,7 @@ LOG_DIR = APP_DIR / "logs"
 STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
 LATEST_FILE = STATE_DIR / "latest.json"
+MONITOR_SLEEP_POLL_SECONDS = 0.5
 KNOWN_BROWSERS = {
     "Google Chrome",
     "Safari",
@@ -183,6 +184,15 @@ def write_latest(payload: dict[str, Any]) -> None:
     LATEST_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def sleep_interruptibly(interval_seconds: int, should_continue: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + max(interval_seconds, 0)
+    while should_continue():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, MONITOR_SLEEP_POLL_SECONDS))
+
+
 def collect_sample() -> ActivitySample:
     collection_error = None
     try:
@@ -220,7 +230,7 @@ def monitor_loop(interval_seconds: int) -> None:
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
-            time.sleep(interval_seconds)
+            sleep_interruptibly(interval_seconds, lambda: keep_running)
     finally:
         if PID_FILE.exists():
             PID_FILE.unlink()
@@ -282,6 +292,8 @@ def stop_monitor() -> None:
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
+    if is_pid_running(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
     print(f"stopped monitor (pid={pid})")

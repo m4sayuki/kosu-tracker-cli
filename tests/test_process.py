@@ -6,7 +6,7 @@ import os
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import is_pid_running, read_pid, require_not_running, sleep_interruptibly, stop_monitor
 
 
 @pytest.fixture(autouse=True)
@@ -74,3 +74,39 @@ class TestRequireNotRunning:
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+
+class TestSleepInterruptibly:
+    def test_rechecks_should_continue_between_short_sleeps(self, monkeypatch):
+        now = 0.0
+        sleeps: list[float] = []
+        running_checks = iter([True, False])
+
+        def fake_sleep(duration: float) -> None:
+            nonlocal now
+            sleeps.append(duration)
+            now += duration
+
+        monkeypatch.setattr(cli_module.time, "monotonic", lambda: now)
+        monkeypatch.setattr(cli_module.time, "sleep", fake_sleep)
+
+        sleep_interruptibly(60, lambda: next(running_checks, False))
+
+        assert sleeps == [cli_module.MONITOR_SLEEP_POLL_SECONDS]
+
+
+class TestStopMonitor:
+    def test_does_not_remove_pid_file_when_process_is_still_running(self, monkeypatch):
+        pid = 12345
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        killed: list[tuple[int, int]] = []
+
+        monkeypatch.setattr(cli_module, "is_pid_running", lambda value: value == pid)
+        monkeypatch.setattr(cli_module.os, "kill", lambda value, signal_number: killed.append((value, signal_number)))
+        monkeypatch.setattr(cli_module.time, "sleep", lambda _: None)
+
+        with pytest.raises(SystemExit, match=r"failed to stop monitor"):
+            stop_monitor()
+
+        assert killed == [(pid, cli_module.signal.SIGTERM)]
+        assert cli_module.PID_FILE.exists()
