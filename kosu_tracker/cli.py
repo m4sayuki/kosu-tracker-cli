@@ -234,6 +234,28 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
+def read_process_command(pid: int) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def is_monitor_process(pid: int) -> bool | None:
+    command = read_process_command(pid)
+    if command is None:
+        return None
+    return "kosu_tracker.cli" in command and "run-monitor" in command
+
+
 def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
@@ -246,7 +268,11 @@ def read_pid() -> int | None:
 def require_not_running() -> None:
     pid = read_pid()
     if pid and is_pid_running(pid):
-        raise SystemExit(f"monitor is already running (pid={pid})")
+        monitor_process = is_monitor_process(pid)
+        if monitor_process:
+            raise SystemExit(f"monitor is already running (pid={pid})")
+        if monitor_process is None:
+            raise SystemExit(f"monitor pid exists but process could not be verified (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
 
@@ -277,6 +303,13 @@ def stop_monitor() -> None:
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
+    monitor_process = is_monitor_process(pid)
+    if not monitor_process:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        if monitor_process is None:
+            raise SystemExit(f"monitor process could not be verified (pid={pid}); not stopping it")
+        raise SystemExit(f"monitor pid file points to non-monitor process (pid={pid}); not stopping it")
     os.kill(pid, signal.SIGTERM)
     for _ in range(20):
         if not is_pid_running(pid):
