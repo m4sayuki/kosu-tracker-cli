@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -234,6 +235,38 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
+def is_monitor_process(pid: int) -> bool:
+    if not is_pid_running(pid):
+        return False
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+
+    if completed.returncode != 0:
+        return False
+
+    command = completed.stdout.strip()
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        return False
+
+    if not args:
+        return False
+
+    if "run-monitor" not in args:
+        return False
+
+    return "-m" in args and "kosu_tracker.cli" in args
+
+
 def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
@@ -245,7 +278,7 @@ def read_pid() -> int | None:
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
@@ -273,13 +306,13 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid or not is_monitor_process(pid):
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
     os.kill(pid, signal.SIGTERM)
     for _ in range(20):
-        if not is_pid_running(pid):
+        if not is_monitor_process(pid):
             break
         time.sleep(0.2)
     if PID_FILE.exists():
@@ -289,7 +322,7 @@ def stop_monitor() -> None:
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")

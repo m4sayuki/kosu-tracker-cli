@@ -1,12 +1,14 @@
-"""Tests for read_pid, is_pid_running, require_not_running."""
+"""Tests for read_pid, is_pid_running, require_not_running, and stop_monitor."""
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import is_monitor_process, is_pid_running, read_pid, require_not_running, stop_monitor
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +56,39 @@ class TestIsPidRunning:
         assert is_pid_running(999_999_998) is False
 
 
+class TestIsMonitorProcess:
+    def test_current_non_monitor_process_returns_false(self):
+        assert is_monitor_process(os.getpid()) is False
+
+    def test_module_run_monitor_command_returns_true(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch(
+            "kosu_tracker.cli.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["ps"],
+                returncode=0,
+                stdout="/usr/bin/python3 -m kosu_tracker.cli run-monitor --interval 60\n",
+                stderr="",
+            ),
+        )
+
+        assert is_monitor_process(12345) is True
+
+    def test_unrelated_live_process_returns_false(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch(
+            "kosu_tracker.cli.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["ps"],
+                returncode=0,
+                stdout="/usr/bin/python3 -m pytest\n",
+                stderr="",
+            ),
+        )
+
+        assert is_monitor_process(12345) is False
+
+
 class TestRequireNotRunning:
     def test_no_pid_file_passes_without_error(self):
         require_not_running()  # should not raise
@@ -63,14 +98,48 @@ class TestRequireNotRunning:
         require_not_running()
         assert not cli_module.PID_FILE.exists()
 
-    def test_active_pid_raises_system_exit(self):
+    def test_unrelated_live_pid_file_is_deleted(self):
+        cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        require_not_running()
+        assert not cli_module.PID_FILE.exists()
+
+    def test_active_monitor_pid_raises_system_exit(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
         cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
         with pytest.raises(SystemExit, match=r"monitor is already running"):
             require_not_running()
 
-    def test_system_exit_message_contains_pid(self):
+    def test_system_exit_message_contains_pid(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
         pid = os.getpid()
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+
+class TestStopMonitor:
+    def test_unrelated_live_pid_is_not_killed(self, mocker):
+        pid = os.getpid()
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=False)
+        mock_kill = mocker.patch("kosu_tracker.cli.os.kill")
+
+        with pytest.raises(SystemExit, match="monitor is not running"):
+            stop_monitor()
+
+        mock_kill.assert_not_called()
+        assert not cli_module.PID_FILE.exists()
+
+    def test_active_monitor_pid_is_terminated(self, mocker):
+        pid = 12345
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_monitor_process", side_effect=[True, False])
+        mock_kill = mocker.patch("kosu_tracker.cli.os.kill")
+        mock_print = mocker.patch("builtins.print")
+
+        stop_monitor()
+
+        mock_kill.assert_called_once_with(pid, signal.SIGTERM)
+        mock_print.assert_called_once_with(f"stopped monitor (pid={pid})")
+        assert not cli_module.PID_FILE.exists()
