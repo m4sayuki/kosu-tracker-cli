@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -234,6 +235,31 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
+def is_monitor_process(pid: int) -> bool:
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    if completed.returncode != 0:
+        return False
+
+    command = completed.stdout.strip()
+    if "run-monitor" not in command:
+        return False
+
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = command.split()
+    executable_names = {Path(arg).name for arg in argv}
+    return "kosu_tracker.cli" in argv or "kosu" in executable_names
+
+
 def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
@@ -246,7 +272,11 @@ def read_pid() -> int | None:
 def require_not_running() -> None:
     pid = read_pid()
     if pid and is_pid_running(pid):
-        raise SystemExit(f"monitor is already running (pid={pid})")
+        if is_monitor_process(pid):
+            raise SystemExit(f"monitor is already running (pid={pid})")
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        return
     if PID_FILE.exists():
         PID_FILE.unlink()
 
@@ -273,7 +303,7 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid or not is_pid_running(pid) or not is_monitor_process(pid):
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
