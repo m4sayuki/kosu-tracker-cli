@@ -42,6 +42,14 @@ class TestRunOsascript:
         assert call_args[1] == "-e"
         assert call_args[2] == "my script"
 
+    def test_timeout_raises_runtime_error(self, mocker):
+        mocker.patch(
+            "kosu_tracker.cli.subprocess.run",
+            side_effect=cli_module.subprocess.TimeoutExpired(["osascript"], timeout=10),
+        )
+        with pytest.raises(RuntimeError, match="osascript timed out"):
+            run_osascript("dummy script")
+
 
 # ── collect_frontmost_app ─────────────────────────────────────────────────────
 

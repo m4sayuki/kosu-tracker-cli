@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -22,6 +23,7 @@ LOG_DIR = APP_DIR / "logs"
 STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
 LATEST_FILE = STATE_DIR / "latest.json"
+OSASCRIPT_TIMEOUT_SECONDS = 10
 KNOWN_BROWSERS = {
     "Google Chrome",
     "Safari",
@@ -62,12 +64,16 @@ def ensure_dirs() -> None:
 
 
 def run_osascript(script: str) -> str:
-    completed = subprocess.run(
-        ["osascript", "-e", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=OSASCRIPT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"osascript timed out after {OSASCRIPT_TIMEOUT_SECONDS} seconds") from exc
     if completed.returncode != 0:
         stderr = completed.stderr.strip() or "unknown osascript error"
         raise RuntimeError(stderr)
@@ -227,6 +233,8 @@ def monitor_loop(interval_seconds: int) -> None:
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -243,9 +251,54 @@ def read_pid() -> int | None:
         return None
 
 
+def process_command_args(pid: int) -> list[str] | None:
+    if pid <= 0:
+        return None
+
+    proc_cmdline = Path("/proc") / str(pid) / "cmdline"
+    try:
+        raw_cmdline = proc_cmdline.read_bytes()
+    except OSError:
+        raw_cmdline = b""
+    if raw_cmdline:
+        args = [part.decode("utf-8", errors="replace") for part in raw_cmdline.split(b"\0") if part]
+        if args:
+            return args
+
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    command = completed.stdout.strip()
+    if not command:
+        return None
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
+def is_monitor_process(pid: int) -> bool:
+    args = process_command_args(pid)
+    if not args or "run-monitor" not in args:
+        return False
+
+    command_text = " ".join(args)
+    executable_names = {Path(arg).name for arg in args}
+    return "kosu_tracker.cli" in command_text or "kosu" in executable_names
+
+
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_pid_running(pid) and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
@@ -277,11 +330,23 @@ def stop_monitor() -> None:
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
+    if not is_monitor_process(pid):
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        raise SystemExit("monitor is not running")
     os.kill(pid, signal.SIGTERM)
     for _ in range(20):
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
+    if is_pid_running(pid):
+        os.kill(pid, signal.SIGKILL)
+        for _ in range(10):
+            if not is_pid_running(pid):
+                break
+            time.sleep(0.2)
+    if is_pid_running(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
     print(f"stopped monitor (pid={pid})")
@@ -289,7 +354,7 @@ def stop_monitor() -> None:
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_pid_running(pid) and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
