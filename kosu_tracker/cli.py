@@ -205,6 +205,8 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise ValueError("interval_seconds must be positive")
     ensure_dirs()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     keep_running = True
@@ -234,6 +236,36 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
+def process_command(pid: int) -> str | None:
+    if not is_pid_running(pid):
+        return None
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def is_monitor_process(pid: int) -> bool:
+    command = process_command(pid)
+    if not command:
+        return False
+
+    parts = command.split()
+    if "run-monitor" not in parts:
+        return False
+    if "kosu_tracker.cli" in parts:
+        return True
+    return bool(parts) and Path(parts[0]).name == "kosu"
+
+
 def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
@@ -245,13 +277,15 @@ def read_pid() -> int | None:
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
 
 
 def start_monitor(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be a positive integer")
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -273,7 +307,7 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid or not is_monitor_process(pid):
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
@@ -289,7 +323,7 @@ def stop_monitor() -> None:
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
@@ -428,12 +462,22 @@ def parse_date(value: str) -> date:
     return date.fromisoformat(value)
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="kosu", description="Background worklog tracker for macOS")
     sub = parser.add_subparsers(dest="command", required=True)
 
     start = sub.add_parser("start", help="Start the background monitor")
-    start.add_argument("--interval", type=int, default=60, help="Sampling interval in seconds")
+    start.add_argument("--interval", type=positive_int, default=60, help="Sampling interval in seconds")
 
     sub.add_parser("stop", help="Stop the background monitor")
     sub.add_parser("status", help="Show monitor status")
@@ -442,13 +486,13 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--json", action="store_true", help="Print JSON only")
 
     run_monitor = sub.add_parser("run-monitor", help=argparse.SUPPRESS)
-    run_monitor.add_argument("--interval", type=int, default=60)
+    run_monitor.add_argument("--interval", type=positive_int, default=60)
 
     report = sub.add_parser("report", help="Summarize one day of logs")
     report.add_argument("target_date", nargs="?", default="today", help="today, yesterday, or YYYY-MM-DD")
     report.add_argument("--with-ai", action="store_true", help="Request an OpenAI summary")
     report.add_argument("--model", default="gpt-5-mini", help="OpenAI model used for --with-ai")
-    report.add_argument("--interval-minutes", type=int, default=1, help="Minutes per sample")
+    report.add_argument("--interval-minutes", type=positive_int, default=1, help="Minutes per sample")
 
     return parser
 
