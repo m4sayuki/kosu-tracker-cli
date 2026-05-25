@@ -174,6 +174,16 @@ def today_log_path(target_date: date | None = None) -> Path:
     return LOG_DIR / f"{current.isoformat()}.jsonl"
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def write_jsonl(path: Path, payload: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -205,6 +215,8 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    if interval_seconds < 1:
+        raise SystemExit("interval must be a positive integer")
     ensure_dirs()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     keep_running = True
@@ -252,6 +264,8 @@ def require_not_running() -> None:
 
 
 def start_monitor(interval_seconds: int) -> None:
+    if interval_seconds < 1:
+        raise SystemExit("interval must be a positive integer")
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -405,6 +419,8 @@ def ai_summarize(summary: dict[str, Any], target_date: date, model: str) -> str:
 
 
 def report_day(target_date: date, with_ai: bool, model: str, interval_minutes: int) -> None:
+    if interval_minutes < 1:
+        raise SystemExit("interval-minutes must be a positive integer")
     rows = iter_logs_for_date(target_date)
     if not rows:
         raise SystemExit(f"no log file found for {target_date.isoformat()}")
@@ -433,7 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     start = sub.add_parser("start", help="Start the background monitor")
-    start.add_argument("--interval", type=int, default=60, help="Sampling interval in seconds")
+    start.add_argument("--interval", type=positive_int, default=60, help="Sampling interval in seconds")
 
     sub.add_parser("stop", help="Stop the background monitor")
     sub.add_parser("status", help="Show monitor status")
@@ -442,13 +458,13 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--json", action="store_true", help="Print JSON only")
 
     run_monitor = sub.add_parser("run-monitor", help=argparse.SUPPRESS)
-    run_monitor.add_argument("--interval", type=int, default=60)
+    run_monitor.add_argument("--interval", type=positive_int, default=60)
 
     report = sub.add_parser("report", help="Summarize one day of logs")
     report.add_argument("target_date", nargs="?", default="today", help="today, yesterday, or YYYY-MM-DD")
     report.add_argument("--with-ai", action="store_true", help="Request an OpenAI summary")
     report.add_argument("--model", default="gpt-5-mini", help="OpenAI model used for --with-ai")
-    report.add_argument("--interval-minutes", type=int, default=1, help="Minutes per sample")
+    report.add_argument("--interval-minutes", type=positive_int, default=1, help="Minutes per sample")
 
     return parser
 
