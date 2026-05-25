@@ -6,7 +6,13 @@ import os
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import (
+    is_pid_running,
+    monitor_loop,
+    read_pid,
+    require_not_running,
+    start_monitor,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -74,3 +80,13 @@ class TestRequireNotRunning:
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+
+class TestIntervalValidation:
+    def test_monitor_loop_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match="interval must be a positive integer"):
+            monitor_loop(0)
+
+    def test_start_monitor_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match="interval must be a positive integer"):
+            start_monitor(0)
