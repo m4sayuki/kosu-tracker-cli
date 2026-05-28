@@ -2,11 +2,20 @@
 from __future__ import annotations
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import (
+    is_monitor_process,
+    is_pid_running,
+    monitor_loop,
+    read_pid,
+    require_not_running,
+    start_monitor,
+    stop_monitor,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +63,26 @@ class TestIsPidRunning:
         assert is_pid_running(999_999_998) is False
 
 
+class TestIsMonitorProcess:
+    def test_run_monitor_command_returns_true(self, mocker):
+        mock_run = mocker.patch("kosu_tracker.cli.subprocess.run")
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="/venv/bin/python -m kosu_tracker.cli run-monitor --interval 60\n",
+        )
+        assert is_monitor_process(12345) is True
+
+    def test_unrelated_command_returns_false(self, mocker):
+        mock_run = mocker.patch("kosu_tracker.cli.subprocess.run")
+        mock_run.return_value = MagicMock(returncode=0, stdout="/usr/bin/python unrelated.py\n")
+        assert is_monitor_process(12345) is False
+
+    def test_ps_failure_returns_false(self, mocker):
+        mock_run = mocker.patch("kosu_tracker.cli.subprocess.run")
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        assert is_monitor_process(12345) is False
+
+
 class TestRequireNotRunning:
     def test_no_pid_file_passes_without_error(self):
         require_not_running()  # should not raise
@@ -63,14 +92,49 @@ class TestRequireNotRunning:
         require_not_running()
         assert not cli_module.PID_FILE.exists()
 
-    def test_active_pid_raises_system_exit(self):
-        cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    def test_active_monitor_pid_raises_system_exit(self, mocker):
+        cli_module.PID_FILE.write_text("12345", encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
         with pytest.raises(SystemExit, match=r"monitor is already running"):
             require_not_running()
 
-    def test_system_exit_message_contains_pid(self):
-        pid = os.getpid()
+    def test_system_exit_message_contains_pid(self, mocker):
+        pid = 12345
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+    def test_active_unrelated_pid_file_is_deleted(self, mocker):
+        cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=False)
+        require_not_running()
+        assert not cli_module.PID_FILE.exists()
+
+
+class TestStopMonitor:
+    def test_active_unrelated_pid_is_not_killed(self, mocker):
+        cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=False)
+        mock_kill = mocker.patch("kosu_tracker.cli.os.kill")
+
+        with pytest.raises(SystemExit, match="different process"):
+            stop_monitor()
+
+        mock_kill.assert_not_called()
+        assert not cli_module.PID_FILE.exists()
+
+
+class TestIntervalValidation:
+    def test_start_monitor_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match="greater than zero"):
+            start_monitor(0)
+
+    def test_monitor_loop_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match="greater than zero"):
+            monitor_loop(0)
