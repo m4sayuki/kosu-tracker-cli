@@ -1,4 +1,4 @@
-"""Tests for read_pid, is_pid_running, require_not_running."""
+"""Tests for monitor PID handling."""
 from __future__ import annotations
 
 import os
@@ -6,7 +6,14 @@ import os
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import (
+    is_monitor_command,
+    is_monitor_pid_running,
+    is_pid_running,
+    read_pid,
+    require_not_running,
+    stop_monitor,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +61,46 @@ class TestIsPidRunning:
         assert is_pid_running(999_999_998) is False
 
 
+class TestIsMonitorCommand:
+    def test_python_module_run_monitor_command_returns_true(self):
+        command = "/usr/bin/python3 -m kosu_tracker.cli run-monitor --interval 60"
+        assert is_monitor_command(command) is True
+
+    def test_console_script_run_monitor_command_returns_true(self):
+        command = "/workspace/.venv/bin/python /workspace/.venv/bin/kosu run-monitor"
+        assert is_monitor_command(command) is True
+
+    def test_unrelated_command_with_same_pid_returns_false(self):
+        assert is_monitor_command("sleep 100") is False
+
+    def test_unrelated_kosu_command_returns_false(self):
+        assert is_monitor_command("/workspace/.venv/bin/kosu status") is False
+
+
+class TestIsMonitorPidRunning:
+    def test_existing_monitor_process_returns_true(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch(
+            "kosu_tracker.cli.read_process_command",
+            return_value="/usr/bin/python3 -m kosu_tracker.cli run-monitor --interval 60",
+        )
+
+        assert is_monitor_pid_running(123) is True
+
+    def test_existing_unrelated_process_returns_false(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch("kosu_tracker.cli.read_process_command", return_value="sleep 100")
+
+        assert is_monitor_pid_running(123) is False
+
+    def test_dead_pid_returns_false_without_reading_command(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=False)
+        read_command = mocker.patch("kosu_tracker.cli.read_process_command")
+
+        assert is_monitor_pid_running(123) is False
+        read_command.assert_not_called()
+
+
 class TestRequireNotRunning:
     def test_no_pid_file_passes_without_error(self):
         require_not_running()  # should not raise
@@ -63,14 +110,35 @@ class TestRequireNotRunning:
         require_not_running()
         assert not cli_module.PID_FILE.exists()
 
-    def test_active_pid_raises_system_exit(self):
+    def test_unrelated_active_pid_is_treated_as_stale(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_monitor_pid_running", return_value=False)
+        cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        require_not_running()
+        assert not cli_module.PID_FILE.exists()
+
+    def test_active_monitor_pid_raises_system_exit(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_monitor_pid_running", return_value=True)
         cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
         with pytest.raises(SystemExit, match=r"monitor is already running"):
             require_not_running()
 
-    def test_system_exit_message_contains_pid(self):
+    def test_system_exit_message_contains_pid(self, mocker):
+        mocker.patch("kosu_tracker.cli.is_monitor_pid_running", return_value=True)
         pid = os.getpid()
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+
+class TestStopMonitor:
+    def test_unrelated_active_pid_is_not_signaled(self, mocker):
+        cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_monitor_pid_running", return_value=False)
+        kill = mocker.patch("kosu_tracker.cli.os.kill")
+
+        with pytest.raises(SystemExit, match="monitor is not running"):
+            stop_monitor()
+
+        kill.assert_not_called()
+        assert not cli_module.PID_FILE.exists()
