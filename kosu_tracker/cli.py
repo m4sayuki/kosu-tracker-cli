@@ -256,11 +256,18 @@ def is_monitor_command(command: str) -> bool:
     except ValueError:
         parts = command.split()
 
-    if "run-monitor" not in parts:
-        return False
-    if "-m" in parts and "kosu_tracker.cli" in parts:
+    if len(parts) >= 4 and parts[1:4] == ["-m", "kosu_tracker.cli", "run-monitor"]:
         return True
-    return any(Path(part).name == "kosu" for part in parts)
+    if len(parts) >= 3 and parts[0].startswith("-") and parts[1:3] == ["kosu_tracker.cli", "run-monitor"]:
+        return True
+    if len(parts) >= 2 and Path(parts[0]).name == "kosu" and parts[1] == "run-monitor":
+        return True
+    return (
+        len(parts) >= 3
+        and Path(parts[0]).name.startswith("python")
+        and Path(parts[1]).name == "kosu"
+        and parts[2] == "run-monitor"
+    )
 
 
 def is_monitor_pid_running(pid: int) -> bool:

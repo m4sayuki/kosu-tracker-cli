@@ -76,6 +76,9 @@ class TestIsMonitorCommand:
     def test_unrelated_kosu_command_returns_false(self):
         assert is_monitor_command("/workspace/.venv/bin/kosu status") is False
 
+    def test_unrelated_command_with_kosu_and_run_monitor_args_returns_false(self):
+        assert is_monitor_command("vim kosu run-monitor") is False
+
 
 class TestIsMonitorPidRunning:
     def test_existing_monitor_process_returns_true(self, mocker):
