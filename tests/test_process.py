@@ -93,12 +93,20 @@ class TestIsMonitorProcess:
         mocker.patch("kosu_tracker.cli.command_for_pid", return_value="/venv/bin/kosu run-monitor --interval 60")
         assert is_monitor_process(12345) is True
 
+    def test_python_console_script_invocation_is_monitor(self, mocker):
+        mocker.patch("kosu_tracker.cli.command_for_pid", return_value="/venv/bin/python /venv/bin/kosu run-monitor --interval 60")
+        assert is_monitor_process(12345) is True
+
     def test_unrelated_command_is_not_monitor(self, mocker):
         mocker.patch("kosu_tracker.cli.command_for_pid", return_value="python worker.py")
         assert is_monitor_process(12345) is False
 
     def test_notes_file_mentioning_kosu_is_not_monitor(self, mocker):
         mocker.patch("kosu_tracker.cli.command_for_pid", return_value="vim 'kosu run-monitor notes.md'")
+        assert is_monitor_process(12345) is False
+
+    def test_python_script_with_kosu_arguments_is_not_monitor(self, mocker):
+        mocker.patch("kosu_tracker.cli.command_for_pid", return_value="python -c 'import time' kosu run-monitor")
         assert is_monitor_process(12345) is False
 
     def test_malformed_command_is_not_monitor(self, mocker):

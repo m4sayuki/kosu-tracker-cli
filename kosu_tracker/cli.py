@@ -268,9 +268,15 @@ def is_monitor_process(pid: int) -> bool:
         args = shlex.split(command)
     except ValueError:
         return False
-    if "run-monitor" not in args:
-        return False
-    return any(arg == "kosu_tracker.cli" or Path(arg).name == "kosu" for arg in args)
+    if len(args) >= 4 and is_python_executable(args[0]) and args[1:4] == ["-m", "kosu_tracker.cli", "run-monitor"]:
+        return True
+    if len(args) >= 2 and Path(args[0]).name == "kosu" and args[1] == "run-monitor":
+        return True
+    return len(args) >= 3 and is_python_executable(args[0]) and Path(args[1]).name == "kosu" and args[2] == "run-monitor"
+
+
+def is_python_executable(value: str) -> bool:
+    return Path(value).name.startswith("python")
 
 
 def unlink_pid_file(expected_pid: int | None = None) -> None:
