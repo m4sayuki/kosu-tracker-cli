@@ -348,6 +348,8 @@ def stop_monitor() -> None:
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
+    if is_pid_running(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
     unlink_pid_file(pid)
     print(f"stopped monitor (pid={pid})")
 

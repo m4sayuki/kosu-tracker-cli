@@ -205,3 +205,18 @@ class TestStopMonitor:
 
         assert cli_module.PID_FILE.exists()
         assert read_pid() == replacement_pid
+
+    def test_running_monitor_pid_file_is_kept_when_signal_does_not_stop_process(self, mocker):
+        pid = 12345
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
+        mocker.patch("kosu_tracker.cli.is_pid_running", return_value=True)
+        mocker.patch("kosu_tracker.cli.time.sleep")
+        mock_kill = mocker.patch("kosu_tracker.cli.os.kill")
+
+        with pytest.raises(SystemExit, match=r"failed to stop monitor"):
+            stop_monitor()
+
+        mock_kill.assert_called_once_with(pid, signal.SIGTERM)
+        assert cli_module.PID_FILE.exists()
+        assert read_pid() == pid
