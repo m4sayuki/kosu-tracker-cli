@@ -197,6 +197,16 @@ class TestStopMonitor:
         kill.assert_called_once_with(1234, cli_module.signal.SIGTERM)
         assert cli_module.PID_FILE.read_text(encoding="utf-8") == "1234"
 
+    def test_process_vanishing_before_signal_cleans_pid_file(self, mocker):
+        cli_module.PID_FILE.write_text("1234", encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
+        mocker.patch("kosu_tracker.cli.os.kill", side_effect=ProcessLookupError)
+
+        with pytest.raises(SystemExit, match="monitor is not running"):
+            stop_monitor()
+
+        assert not cli_module.PID_FILE.exists()
+
     def test_stop_does_not_unlink_replaced_pid_file(self, mocker):
         cli_module.PID_FILE.write_text("1234", encoding="utf-8")
         mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)

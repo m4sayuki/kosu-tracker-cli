@@ -337,7 +337,11 @@ def stop_monitor() -> None:
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
-    os.kill(pid, signal.SIGTERM)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        unlink_pid_file_if_owned(pid)
+        raise SystemExit("monitor is not running") from None
     for _ in range(20):
         if not is_pid_running(pid):
             unlink_pid_file_if_owned(pid)
