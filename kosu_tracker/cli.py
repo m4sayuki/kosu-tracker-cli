@@ -348,7 +348,7 @@ def stop_monitor() -> None:
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")

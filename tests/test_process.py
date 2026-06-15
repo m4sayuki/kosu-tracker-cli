@@ -10,6 +10,7 @@ import kosu_tracker.cli as cli_module
 from kosu_tracker.cli import (
     command_is_monitor,
     is_pid_running,
+    print_status,
     read_pid,
     remove_pid_file,
     require_not_running,
@@ -175,3 +176,13 @@ class TestStopMonitor:
         with pytest.raises(SystemExit, match=r"monitor is not running"):
             stop_monitor()
         assert not cli_module.PID_FILE.exists()
+
+
+class TestPrintStatus:
+    def test_unrelated_live_pid_is_not_reported_running(self, monkeypatch, capsys):
+        cli_module.PID_FILE.write_text("12345", encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda pid: False)
+        print_status()
+        captured = capsys.readouterr()
+        assert "running: no" in captured.out
+        assert "pid: 12345" not in captured.out
