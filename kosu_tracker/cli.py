@@ -183,6 +183,11 @@ def write_latest(payload: dict[str, Any]) -> None:
     LATEST_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def validate_positive_interval(value: int, label: str) -> None:
+    if value <= 0:
+        raise SystemExit(f"{label} must be greater than 0")
+
+
 def collect_sample() -> ActivitySample:
     collection_error = None
     try:
@@ -205,8 +210,10 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds, "interval")
     ensure_dirs()
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    own_pid = os.getpid()
+    PID_FILE.write_text(str(own_pid), encoding="utf-8")
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
@@ -218,20 +225,57 @@ def monitor_loop(interval_seconds: int) -> None:
     try:
         while keep_running:
             sample = collect_sample().as_dict()
+            sample["sample_interval_seconds"] = interval_seconds
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
             time.sleep(interval_seconds)
     finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        remove_pid_file(expected_pid=own_pid)
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def process_command(pid: int) -> str | None:
+    if not is_pid_running(pid):
+        return None
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def command_is_monitor(command: str) -> bool:
+    parts = command.split()
+    if "run-monitor" not in parts:
+        return False
+    return any(
+        part == "kosu_tracker.cli"
+        or Path(part).name == "kosu"
+        or (Path(part).name == "cli.py" and "kosu_tracker" in part)
+        for part in parts
+    )
+
+
+def is_monitor_process(pid: int) -> bool:
+    command = process_command(pid)
+    return bool(command and command_is_monitor(command))
 
 
 def read_pid() -> int | None:
@@ -243,15 +287,26 @@ def read_pid() -> int | None:
         return None
 
 
+def remove_pid_file(expected_pid: int | None = None) -> None:
+    if not PID_FILE.exists():
+        return
+    if expected_pid is not None and read_pid() != expected_pid:
+        return
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    remove_pid_file()
 
 
 def start_monitor(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds, "interval")
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -273,23 +328,27 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+    if not pid or not is_monitor_process(pid):
+        remove_pid_file(expected_pid=pid)
         raise SystemExit("monitor is not running")
-    os.kill(pid, signal.SIGTERM)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        remove_pid_file(expected_pid=pid)
+        raise SystemExit("monitor is not running") from None
     for _ in range(20):
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    if is_pid_running(pid):
+        raise SystemExit(f"monitor did not stop within timeout (pid={pid})")
+    remove_pid_file(expected_pid=pid)
     print(f"stopped monitor (pid={pid})")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
@@ -315,26 +374,36 @@ def iter_logs_for_date(target_date: date) -> list[dict[str, Any]]:
 
 
 def summarize_rows(rows: list[dict[str, Any]], interval_minutes: int) -> dict[str, Any]:
-    by_app: dict[str, int] = defaultdict(int)
-    by_category: dict[str, int] = defaultdict(int)
-    by_browser_title: dict[str, int] = defaultdict(int)
+    validate_positive_interval(interval_minutes, "interval-minutes")
+    by_app: dict[str, float] = defaultdict(float)
+    by_category: dict[str, float] = defaultdict(float)
+    by_browser_title: dict[str, float] = defaultdict(float)
+    total_minutes = 0.0
 
     for row in rows:
-        minutes = interval_minutes
+        interval_seconds = row.get("sample_interval_seconds")
+        if isinstance(interval_seconds, (int, float)) and interval_seconds > 0:
+            minutes = interval_seconds / 60
+        else:
+            minutes = interval_minutes
+        total_minutes += minutes
         by_app[row["app_name"]] += minutes
         by_category[row["category"]] += minutes
         title = row.get("browser_title") or row.get("window_title") or row["app_name"]
         by_browser_title[title] += minutes
 
-    def sort_items(data: dict[str, int]) -> list[dict[str, Any]]:
+    def format_minutes(minutes: float) -> int | float:
+        return int(minutes) if minutes.is_integer() else minutes
+
+    def sort_items(data: dict[str, float]) -> list[dict[str, Any]]:
         return [
-            {"name": name, "minutes": minutes, "hours": round(minutes / 60, 2)}
+            {"name": name, "minutes": format_minutes(minutes), "hours": round(minutes / 60, 2)}
             for name, minutes in sorted(data.items(), key=lambda item: (-item[1], item[0]))
         ]
 
     return {
         "total_samples": len(rows),
-        "estimated_total_minutes": len(rows) * interval_minutes,
+        "estimated_total_minutes": format_minutes(total_minutes),
         "by_app": sort_items(by_app),
         "by_category": sort_items(by_category),
         "top_titles": sort_items(dict(list(sorted(by_browser_title.items(), key=lambda item: (-item[1], item[0])))[:10])),

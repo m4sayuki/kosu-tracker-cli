@@ -13,13 +13,17 @@ def _make_row(
     category: str = "other",
     browser_title: str | None = None,
     window_title: str | None = None,
+    sample_interval_seconds: int | None = None,
 ) -> dict:
-    return {
+    row = {
         "app_name": app_name,
         "category": category,
         "browser_title": browser_title,
         "window_title": window_title,
     }
+    if sample_interval_seconds is not None:
+        row["sample_interval_seconds"] = sample_interval_seconds
+    return row
 
 
 class TestSummarizeRows:
@@ -44,6 +48,29 @@ class TestSummarizeRows:
         result = summarize_rows(rows, interval_minutes=5)
         assert result["estimated_total_minutes"] == 15
         assert result["by_app"][0]["minutes"] == 15
+
+    def test_sample_interval_seconds_overrides_report_default(self):
+        rows = [
+            _make_row("Chrome", "browser", sample_interval_seconds=30),
+            _make_row("Chrome", "browser", sample_interval_seconds=30),
+        ]
+        result = summarize_rows(rows, interval_minutes=1)
+        assert result["estimated_total_minutes"] == 1
+        assert result["by_app"][0]["minutes"] == 1
+
+    def test_missing_sample_interval_uses_report_default(self):
+        rows = [
+            _make_row("Chrome", "browser", sample_interval_seconds=30),
+            _make_row("Cursor", "development"),
+        ]
+        result = summarize_rows(rows, interval_minutes=5)
+        by_app = {item["name"]: item["minutes"] for item in result["by_app"]}
+        assert by_app["Chrome"] == 0.5
+        assert by_app["Cursor"] == 5
+
+    def test_rejects_zero_interval_minutes(self):
+        with pytest.raises(SystemExit, match=r"interval-minutes must be greater than 0"):
+            summarize_rows([_make_row("Chrome", "browser")], interval_minutes=0)
 
     def test_multiple_apps_accumulated(self):
         rows = [_make_row("Chrome", "browser")] * 2 + [_make_row("Cursor", "development")]
