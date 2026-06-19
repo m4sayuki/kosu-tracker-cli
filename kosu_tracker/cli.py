@@ -22,6 +22,7 @@ LOG_DIR = APP_DIR / "logs"
 STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
 LATEST_FILE = STATE_DIR / "latest.json"
+MONITOR_COMMAND_MARKERS = ("kosu_tracker.cli", "run-monitor")
 KNOWN_BROWSERS = {
     "Google Chrome",
     "Safari",
@@ -205,8 +206,10 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds)
     ensure_dirs()
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    own_pid = os.getpid()
+    PID_FILE.write_text(str(own_pid), encoding="utf-8")
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
@@ -222,16 +225,41 @@ def monitor_loop(interval_seconds: int) -> None:
             write_latest(sample)
             time.sleep(interval_seconds)
     finally:
-        if PID_FILE.exists():
+        if read_pid() == own_pid and PID_FILE.exists():
             PID_FILE.unlink()
 
 
+def validate_positive_interval(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be positive")
+
+
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def is_monitor_process(pid: int) -> bool:
+    if not is_pid_running(pid):
+        return False
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    if completed.returncode != 0:
+        return False
+    command = completed.stdout.strip()
+    return all(marker in command for marker in MONITOR_COMMAND_MARKERS)
 
 
 def read_pid() -> int | None:
@@ -245,13 +273,14 @@ def read_pid() -> int | None:
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
 
 
 def start_monitor(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds)
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -273,7 +302,7 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid or not is_monitor_process(pid):
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
@@ -289,7 +318,7 @@ def stop_monitor() -> None:
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
@@ -474,6 +503,7 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(sample, ensure_ascii=False, indent=2))
         return
     if args.command == "run-monitor":
+        validate_positive_interval(args.interval)
         monitor_loop(interval_seconds=args.interval)
         return
     if args.command == "report":
