@@ -22,6 +22,9 @@ LOG_DIR = APP_DIR / "logs"
 STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
 LATEST_FILE = STATE_DIR / "latest.json"
+STARTUP_TIMEOUT_SECONDS = 10.0
+STOP_TIMEOUT_SECONDS = 5.0
+POLL_INTERVAL_SECONDS = 0.2
 KNOWN_BROWSERS = {
     "Google Chrome",
     "Safari",
@@ -205,8 +208,9 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    validate_interval(interval_seconds)
     ensure_dirs()
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    claim_pid_file(os.getpid())
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
@@ -220,18 +224,45 @@ def monitor_loop(interval_seconds: int) -> None:
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
-            time.sleep(interval_seconds)
+            remaining = float(interval_seconds)
+            while keep_running and remaining > 0:
+                sleep_for = min(POLL_INTERVAL_SECONDS, remaining)
+                time.sleep(sleep_for)
+                remaining -= sleep_for
     finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        unlink_pid_file_if_matches(os.getpid())
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def process_command(pid: int) -> str | None:
+    if pid <= 0:
+        return None
+    completed = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None
+    command = completed.stdout.strip()
+    return command or None
+
+
+def is_monitor_process(pid: int) -> bool:
+    command = process_command(pid)
+    if command is None:
+        return False
+    return "run-monitor" in command and ("kosu_tracker.cli" in command or "kosu" in command)
 
 
 def read_pid() -> int | None:
@@ -243,19 +274,49 @@ def read_pid() -> int | None:
         return None
 
 
-def require_not_running() -> None:
-    pid = read_pid()
-    if pid and is_pid_running(pid):
-        raise SystemExit(f"monitor is already running (pid={pid})")
-    if PID_FILE.exists():
+def unlink_pid_file_if_matches(pid: int | None) -> None:
+    if not PID_FILE.exists():
+        return
+    current_pid = read_pid()
+    if (pid is None and current_pid is None) or current_pid == pid:
         PID_FILE.unlink()
 
 
+def claim_pid_file(pid: int) -> None:
+    for _ in range(2):
+        try:
+            fd = os.open(PID_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            existing_pid = read_pid()
+            if existing_pid and is_monitor_process(existing_pid):
+                raise SystemExit(f"monitor is already running (pid={existing_pid})")
+            unlink_pid_file_if_matches(existing_pid)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(pid))
+        return
+    raise SystemExit("failed to claim monitor pid file")
+
+
+def validate_interval(interval_seconds: int) -> None:
+    if interval_seconds < 1:
+        raise SystemExit("interval must be at least 1 second")
+
+
+def require_not_running() -> None:
+    pid = read_pid()
+    if pid and is_monitor_process(pid):
+        raise SystemExit(f"monitor is already running (pid={pid})")
+    if PID_FILE.exists():
+        unlink_pid_file_if_matches(pid)
+
+
 def start_monitor(interval_seconds: int) -> None:
+    validate_interval(interval_seconds)
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [sys.executable, "-m", "kosu_tracker.cli", "run-monitor", "--interval", str(interval_seconds)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -263,9 +324,21 @@ def start_monitor(interval_seconds: int) -> None:
         start_new_session=True,
         env=env,
     )
-    time.sleep(1)
-    pid = read_pid()
-    if not pid:
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    pid = None
+    while time.monotonic() < deadline:
+        pid = read_pid()
+        if pid and is_monitor_process(pid):
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(POLL_INTERVAL_SECONDS)
+    else:
+        pid = read_pid()
+
+    if not pid or not is_monitor_process(pid):
+        if proc.poll() is None:
+            proc.terminate()
         raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
     print(f"started monitor (pid={pid})")
     print(f"log directory: {LOG_DIR}")
@@ -273,23 +346,24 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+    if not pid or not is_pid_running(pid) or not is_monitor_process(pid):
+        unlink_pid_file_if_matches(pid)
         raise SystemExit("monitor is not running")
     os.kill(pid, signal.SIGTERM)
-    for _ in range(20):
-        if not is_pid_running(pid):
+    deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not is_pid_running(pid) or not is_monitor_process(pid):
             break
-        time.sleep(0.2)
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+        time.sleep(POLL_INTERVAL_SECONDS)
+    if is_pid_running(pid) and is_monitor_process(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
+    unlink_pid_file_if_matches(pid)
     print(f"stopped monitor (pid={pid})")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
