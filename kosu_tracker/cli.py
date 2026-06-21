@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 APP_DIR = Path(os.environ.get("KOSU_TRACKER_HOME", Path.home() / ".local" / "share" / "kosu-tracker")).expanduser()
@@ -183,6 +184,11 @@ def write_latest(payload: dict[str, Any]) -> None:
     LATEST_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def validate_positive_interval(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be a positive number of seconds")
+
+
 def collect_sample() -> ActivitySample:
     collection_error = None
     try:
@@ -204,9 +210,20 @@ def collect_sample() -> ActivitySample:
     )
 
 
+def interruptible_sleep(interval_seconds: int, should_continue: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + interval_seconds
+    while should_continue():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
+
+
 def monitor_loop(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds)
     ensure_dirs()
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    current_pid = os.getpid()
+    PID_FILE.write_text(str(current_pid), encoding="utf-8")
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
@@ -220,16 +237,20 @@ def monitor_loop(interval_seconds: int) -> None:
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
-            time.sleep(interval_seconds)
+            interruptible_sleep(interval_seconds, lambda: keep_running)
     finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        unlink_pid_file_if_matches(current_pid)
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
+        return False
+    status = process_status(pid)
+    if status and status.startswith("Z"):
         return False
     return True
 
@@ -243,15 +264,70 @@ def read_pid() -> int | None:
         return None
 
 
-def require_not_running() -> None:
-    pid = read_pid()
-    if pid and is_pid_running(pid):
-        raise SystemExit(f"monitor is already running (pid={pid})")
-    if PID_FILE.exists():
+def process_args(pid: int) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def process_status(pid: int) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def is_monitor_process(pid: int) -> bool:
+    if not is_pid_running(pid):
+        return False
+    args = process_args(pid)
+    if not args:
+        return False
+    try:
+        tokens = shlex.split(args)
+    except ValueError:
+        return False
+    if "run-monitor" not in tokens:
+        return False
+    executable = Path(tokens[0]).name if tokens else ""
+    return "kosu_tracker.cli" in tokens or executable == "kosu"
+
+
+def unlink_pid_file_if_matches(expected_pid: int | None) -> None:
+    if not PID_FILE.exists():
+        return
+    current_pid = read_pid()
+    should_unlink = current_pid == expected_pid if expected_pid is not None else current_pid is None
+    if should_unlink and PID_FILE.exists():
         PID_FILE.unlink()
 
 
+def require_not_running() -> None:
+    pid = read_pid()
+    if pid and is_monitor_process(pid):
+        raise SystemExit(f"monitor is already running (pid={pid})")
+    unlink_pid_file_if_matches(pid)
+
+
 def start_monitor(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds)
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -265,7 +341,8 @@ def start_monitor(interval_seconds: int) -> None:
     )
     time.sleep(1)
     pid = read_pid()
-    if not pid:
+    if not pid or not is_monitor_process(pid):
+        unlink_pid_file_if_matches(pid)
         raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
     print(f"started monitor (pid={pid})")
     print(f"log directory: {LOG_DIR}")
@@ -273,23 +350,23 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+    if not pid or not is_monitor_process(pid):
+        unlink_pid_file_if_matches(pid)
         raise SystemExit("monitor is not running")
     os.kill(pid, signal.SIGTERM)
     for _ in range(20):
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    if is_pid_running(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
+    unlink_pid_file_if_matches(pid)
     print(f"stopped monitor (pid={pid})")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
