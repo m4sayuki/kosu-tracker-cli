@@ -65,6 +65,12 @@ class TestIsPidRunning:
     def test_negative_pid_returns_false(self):
         assert is_pid_running(-1) is False
 
+    def test_zombie_pid_returns_false(self, monkeypatch):
+        monkeypatch.setattr(cli_module.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(cli_module, "process_status", lambda pid: "Z+")
+
+        assert is_pid_running(12345) is False
+
 
 class TestIsMonitorProcess:
     def test_python_module_run_monitor_is_recognized(self, monkeypatch):

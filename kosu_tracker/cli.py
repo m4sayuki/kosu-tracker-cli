@@ -249,6 +249,9 @@ def is_pid_running(pid: int) -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
+    status = process_status(pid)
+    if status and status.startswith("Z"):
+        return False
     return True
 
 
@@ -265,6 +268,21 @@ def process_args(pid: int) -> str | None:
     try:
         completed = subprocess.run(
             ["ps", "-p", str(pid), "-o", "args="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def process_status(pid: int) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
             check=False,
             capture_output=True,
             text=True,
