@@ -8,6 +8,7 @@ import pytest
 
 import kosu_tracker.cli as cli_module
 from kosu_tracker.cli import (
+    interruptible_sleep,
     is_monitor_process,
     is_pid_running,
     monitor_loop,
@@ -220,3 +221,33 @@ class TestIntervals:
             monitor_loop(-1)
 
         assert not cli_module.PID_FILE.exists()
+
+    def test_interruptible_sleep_uses_short_chunks(self, monkeypatch):
+        current_time = [0.0]
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(cli_module.time, "monotonic", lambda: current_time[0])
+
+        def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            current_time[0] += seconds
+
+        monkeypatch.setattr(cli_module.time, "sleep", fake_sleep)
+
+        interruptible_sleep(2, lambda: True)
+
+        assert sleep_calls == [1.0, 1.0]
+
+    def test_interruptible_sleep_stops_after_continue_flag_clears(self, monkeypatch):
+        current_time = [0.0]
+        sleep_calls: list[float] = []
+        monkeypatch.setattr(cli_module.time, "monotonic", lambda: current_time[0])
+
+        def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            current_time[0] += seconds
+
+        monkeypatch.setattr(cli_module.time, "sleep", fake_sleep)
+
+        interruptible_sleep(60, lambda: not sleep_calls)
+
+        assert sleep_calls == [1.0]

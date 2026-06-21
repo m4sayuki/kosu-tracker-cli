@@ -15,7 +15,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 APP_DIR = Path(os.environ.get("KOSU_TRACKER_HOME", Path.home() / ".local" / "share" / "kosu-tracker")).expanduser()
@@ -210,6 +210,15 @@ def collect_sample() -> ActivitySample:
     )
 
 
+def interruptible_sleep(interval_seconds: int, should_continue: Callable[[], bool]) -> None:
+    deadline = time.monotonic() + interval_seconds
+    while should_continue():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
+
+
 def monitor_loop(interval_seconds: int) -> None:
     validate_positive_interval(interval_seconds)
     ensure_dirs()
@@ -228,7 +237,7 @@ def monitor_loop(interval_seconds: int) -> None:
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
-            time.sleep(interval_seconds)
+            interruptible_sleep(interval_seconds, lambda: keep_running)
     finally:
         unlink_pid_file_if_matches(current_pid)
 
