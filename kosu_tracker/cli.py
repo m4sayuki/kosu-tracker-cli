@@ -61,6 +61,16 @@ def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def run_osascript(script: str) -> str:
     completed = subprocess.run(
         ["osascript", "-e", script],
@@ -205,8 +215,11 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be a positive integer")
     ensure_dirs()
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    monitor_pid = os.getpid()
+    PID_FILE.write_text(str(monitor_pid), encoding="utf-8")
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
@@ -222,11 +235,13 @@ def monitor_loop(interval_seconds: int) -> None:
             write_latest(sample)
             time.sleep(interval_seconds)
     finally:
-        if PID_FILE.exists():
+        if pid_file_matches(monitor_pid):
             PID_FILE.unlink()
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -234,24 +249,51 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
+def is_monitor_process(pid: int) -> bool:
+    if not is_pid_running(pid):
+        return False
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    if completed.returncode != 0:
+        return False
+    command = completed.stdout.strip()
+    return "kosu_tracker.cli" in command and "run-monitor" in command
+
+
 def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
     try:
-        return int(PID_FILE.read_text(encoding="utf-8").strip())
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
     except ValueError:
         return None
+    if pid <= 0:
+        return None
+    return pid
+
+
+def pid_file_matches(pid: int) -> bool:
+    return read_pid() == pid
 
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
 
 
 def start_monitor(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be a positive integer")
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -265,7 +307,7 @@ def start_monitor(interval_seconds: int) -> None:
     )
     time.sleep(1)
     pid = read_pid()
-    if not pid:
+    if not pid or not is_monitor_process(pid):
         raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
     print(f"started monitor (pid={pid})")
     print(f"log directory: {LOG_DIR}")
@@ -273,23 +315,25 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid or not is_monitor_process(pid):
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
     os.kill(pid, signal.SIGTERM)
     for _ in range(20):
-        if not is_pid_running(pid):
+        if not is_monitor_process(pid):
             break
         time.sleep(0.2)
-    if PID_FILE.exists():
+    if is_monitor_process(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
+    if pid_file_matches(pid):
         PID_FILE.unlink()
     print(f"stopped monitor (pid={pid})")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
@@ -405,6 +449,8 @@ def ai_summarize(summary: dict[str, Any], target_date: date, model: str) -> str:
 
 
 def report_day(target_date: date, with_ai: bool, model: str, interval_minutes: int) -> None:
+    if interval_minutes <= 0:
+        raise SystemExit("interval-minutes must be a positive integer")
     rows = iter_logs_for_date(target_date)
     if not rows:
         raise SystemExit(f"no log file found for {target_date.isoformat()}")
@@ -433,7 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     start = sub.add_parser("start", help="Start the background monitor")
-    start.add_argument("--interval", type=int, default=60, help="Sampling interval in seconds")
+    start.add_argument("--interval", type=positive_int, default=60, help="Sampling interval in seconds")
 
     sub.add_parser("stop", help="Stop the background monitor")
     sub.add_parser("status", help="Show monitor status")
@@ -442,13 +488,13 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--json", action="store_true", help="Print JSON only")
 
     run_monitor = sub.add_parser("run-monitor", help=argparse.SUPPRESS)
-    run_monitor.add_argument("--interval", type=int, default=60)
+    run_monitor.add_argument("--interval", type=positive_int, default=60)
 
     report = sub.add_parser("report", help="Summarize one day of logs")
     report.add_argument("target_date", nargs="?", default="today", help="today, yesterday, or YYYY-MM-DD")
     report.add_argument("--with-ai", action="store_true", help="Request an OpenAI summary")
     report.add_argument("--model", default="gpt-5-mini", help="OpenAI model used for --with-ai")
-    report.add_argument("--interval-minutes", type=int, default=1, help="Minutes per sample")
+    report.add_argument("--interval-minutes", type=positive_int, default=1, help="Minutes per sample")
 
     return parser
 
