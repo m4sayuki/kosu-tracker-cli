@@ -254,7 +254,7 @@ def is_monitor_process(pid: int) -> bool:
         return False
     try:
         completed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             check=False,
             capture_output=True,
             text=True,
