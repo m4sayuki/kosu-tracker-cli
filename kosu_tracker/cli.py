@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -183,6 +184,11 @@ def write_latest(payload: dict[str, Any]) -> None:
     LATEST_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def validate_positive_interval(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be greater than 0 seconds")
+
+
 def collect_sample() -> ActivitySample:
     collection_error = None
     try:
@@ -205,8 +211,10 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds)
     ensure_dirs()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    monitor_pid = os.getpid()
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
@@ -222,11 +230,13 @@ def monitor_loop(interval_seconds: int) -> None:
             write_latest(sample)
             time.sleep(interval_seconds)
     finally:
-        if PID_FILE.exists():
+        if PID_FILE.exists() and read_pid() == monitor_pid:
             PID_FILE.unlink()
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -234,24 +244,63 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
+def is_monitor_process(pid: int) -> bool:
+    if not is_pid_running(pid):
+        return False
+    try:
+        completed = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    command = completed.stdout.strip()
+    if completed.returncode != 0 or not command:
+        return False
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        return False
+    if "run-monitor" not in args:
+        return False
+    return "kosu_tracker.cli" in args or (bool(args) and Path(args[0]).name == "kosu")
+
+
 def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
     try:
-        return int(PID_FILE.read_text(encoding="utf-8").strip())
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
     except ValueError:
         return None
+    return pid if pid > 0 else None
+
+
+def remove_pid_file_if_matches(pid: int) -> None:
+    if read_pid() == pid:
+        PID_FILE.unlink(missing_ok=True)
+
+
+def remove_invalid_pid_file() -> None:
+    if PID_FILE.exists() and read_pid() is None:
+        PID_FILE.unlink()
 
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    if pid:
+        remove_pid_file_if_matches(pid)
+    else:
+        remove_invalid_pid_file()
 
 
 def start_monitor(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds)
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -265,7 +314,7 @@ def start_monitor(interval_seconds: int) -> None:
     )
     time.sleep(1)
     pid = read_pid()
-    if not pid:
+    if not pid or not is_monitor_process(pid):
         raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
     print(f"started monitor (pid={pid})")
     print(f"log directory: {LOG_DIR}")
@@ -273,23 +322,32 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+    if not pid:
+        remove_invalid_pid_file()
         raise SystemExit("monitor is not running")
-    os.kill(pid, signal.SIGTERM)
+    if not is_monitor_process(pid):
+        remove_pid_file_if_matches(pid)
+        raise SystemExit("monitor is not running")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        remove_pid_file_if_matches(pid)
+        raise SystemExit("monitor is not running")
+    except PermissionError as exc:
+        raise SystemExit(f"failed to stop monitor (pid={pid}): permission denied") from exc
     for _ in range(20):
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    if is_pid_running(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
+    remove_pid_file_if_matches(pid)
     print(f"stopped monitor (pid={pid})")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
