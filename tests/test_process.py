@@ -1,12 +1,13 @@
-"""Tests for read_pid, is_pid_running, require_not_running."""
+"""Tests for PID-file and monitor process handling."""
 from __future__ import annotations
 
 import os
+import signal
 
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import is_pid_running, read_pid, require_not_running, stop_monitor
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +40,12 @@ class TestReadPid:
         cli_module.PID_FILE.write_text("", encoding="utf-8")
         assert read_pid() is None
 
+    def test_non_positive_pid_returns_none(self):
+        cli_module.PID_FILE.write_text("-1", encoding="utf-8")
+        assert read_pid() is None
+        cli_module.PID_FILE.write_text("0", encoding="utf-8")
+        assert read_pid() is None
+
 
 class TestIsPidRunning:
     def test_current_process_is_running(self):
@@ -48,10 +55,19 @@ class TestIsPidRunning:
         # PID 999999999 は通常存在しない
         assert is_pid_running(999_999_999) is False
 
-    def test_zero_pid_returns_false(self):
-        # os.kill(0, 0) はプロセスグループ全体に送られるが OSError が出ないケースもある
-        # ここではモックを使って確実にFalseを返すシナリオをテスト
-        assert is_pid_running(999_999_998) is False
+    def test_zero_pid_returns_false_without_signalling(self, monkeypatch):
+        def fail_if_called(pid, sig):
+            raise AssertionError("os.kill must not be called for pid 0")
+
+        monkeypatch.setattr(cli_module.os, "kill", fail_if_called)
+        assert is_pid_running(0) is False
+
+    def test_negative_pid_returns_false_without_signalling(self, monkeypatch):
+        def fail_if_called(pid, sig):
+            raise AssertionError("os.kill must not be called for negative pids")
+
+        monkeypatch.setattr(cli_module.os, "kill", fail_if_called)
+        assert is_pid_running(-1) is False
 
 
 class TestRequireNotRunning:
@@ -63,14 +79,83 @@ class TestRequireNotRunning:
         require_not_running()
         assert not cli_module.PID_FILE.exists()
 
-    def test_active_pid_raises_system_exit(self):
+    def test_active_monitor_pid_raises_system_exit(self, monkeypatch):
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda pid: pid == os.getpid())
         cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
         with pytest.raises(SystemExit, match=r"monitor is already running"):
             require_not_running()
 
-    def test_system_exit_message_contains_pid(self):
+    def test_system_exit_message_contains_pid(self, monkeypatch):
         pid = os.getpid()
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: candidate == pid)
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+    def test_live_unrelated_pid_file_is_deleted(self, monkeypatch):
+        pid = os.getpid()
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: False)
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+
+        require_not_running()
+
+        assert not cli_module.PID_FILE.exists()
+
+
+class TestStopMonitor:
+    def test_unrelated_live_pid_is_not_signalled(self, monkeypatch):
+        pid = os.getpid()
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: False)
+
+        kill_calls = []
+        monkeypatch.setattr(cli_module.os, "kill", lambda candidate, sig: kill_calls.append((candidate, sig)))
+
+        with pytest.raises(SystemExit, match=r"monitor is not running"):
+            stop_monitor()
+
+        assert kill_calls == []
+        assert not cli_module.PID_FILE.exists()
+
+    def test_monitor_pid_gets_sigterm(self, monkeypatch):
+        pid = 12345
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monitor_checks = iter([True, False, False])
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: next(monitor_checks))
+
+        kill_calls = []
+        monkeypatch.setattr(cli_module.os, "kill", lambda candidate, sig: kill_calls.append((candidate, sig)))
+
+        stop_monitor()
+
+        assert kill_calls == [(pid, signal.SIGTERM)]
+        assert not cli_module.PID_FILE.exists()
+
+    def test_replaced_pid_file_is_preserved(self, monkeypatch):
+        pid = 12345
+        replacement_pid = 67890
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monitor_checks = iter([True, False, False])
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: next(monitor_checks))
+
+        def fake_kill(candidate, sig):
+            cli_module.PID_FILE.write_text(str(replacement_pid), encoding="utf-8")
+
+        monkeypatch.setattr(cli_module.os, "kill", fake_kill)
+
+        stop_monitor()
+
+        assert cli_module.PID_FILE.read_text(encoding="utf-8") == str(replacement_pid)
+
+    def test_pid_file_remains_when_stop_cannot_confirm_exit(self, monkeypatch):
+        pid = 12345
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: True)
+        monkeypatch.setattr(cli_module.os, "kill", lambda candidate, sig: None)
+        monkeypatch.setattr(cli_module.time, "sleep", lambda seconds: None)
+
+        with pytest.raises(SystemExit, match=r"failed to stop monitor"):
+            stop_monitor()
+
+        assert cli_module.PID_FILE.read_text(encoding="utf-8") == str(pid)
