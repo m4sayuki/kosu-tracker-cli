@@ -269,7 +269,7 @@ def process_command(pid: int) -> str | None:
         return None
     try:
         completed = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             check=False,
             capture_output=True,
             text=True,
@@ -293,7 +293,8 @@ def command_is_monitor_process(command: str) -> bool:
         if token == "-m" and tokens[index + 1] == "kosu_tracker.cli":
             return True
 
-    return Path(tokens[0]).name == "kosu"
+    run_monitor_index = tokens.index("run-monitor")
+    return any(Path(token).name == "kosu" for token in tokens[:run_monitor_index])
 
 
 def is_monitor_process(pid: int) -> bool:
