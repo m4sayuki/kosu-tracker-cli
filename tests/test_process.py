@@ -77,6 +77,10 @@ class TestMonitorProcessDetection:
         command = "/tmp/venv/bin/kosu run-monitor --interval 60"
         assert command_is_monitor_process(command) is True
 
+    def test_python_console_script_run_monitor_command(self):
+        command = "/tmp/venv/bin/python /tmp/venv/bin/kosu run-monitor --interval 60"
+        assert command_is_monitor_process(command) is True
+
     def test_unrelated_process_with_run_monitor_argument_is_not_monitor(self):
         command = "/usr/bin/python3 worker.py run-monitor"
         assert command_is_monitor_process(command) is False
