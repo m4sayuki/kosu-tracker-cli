@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -205,6 +206,7 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    validate_interval_seconds(interval_seconds)
     ensure_dirs()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     keep_running = True
@@ -222,11 +224,12 @@ def monitor_loop(interval_seconds: int) -> None:
             write_latest(sample)
             time.sleep(interval_seconds)
     finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        unlink_pid_file_if_matches(os.getpid())
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -238,20 +241,82 @@ def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
     try:
-        return int(PID_FILE.read_text(encoding="utf-8").strip())
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
     except ValueError:
         return None
+    if pid <= 0:
+        return None
+    return pid
+
+
+def validate_interval_seconds(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("--interval must be a positive number of seconds")
+
+
+def positive_interval(value: str) -> int:
+    try:
+        interval_seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if interval_seconds <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number of seconds")
+    return interval_seconds
+
+
+def process_command(pid: int) -> str | None:
+    if pid <= 0:
+        return None
+    try:
+        completed = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def command_is_monitor_process(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if not tokens or "run-monitor" not in tokens:
+        return False
+
+    for index, token in enumerate(tokens[:-1]):
+        if token == "-m" and tokens[index + 1] == "kosu_tracker.cli":
+            return True
+
+    run_monitor_index = tokens.index("run-monitor")
+    return any(Path(token).name == "kosu" for token in tokens[:run_monitor_index])
+
+
+def is_monitor_process(pid: int) -> bool:
+    command = process_command(pid)
+    return bool(command and command_is_monitor_process(command))
+
+
+def unlink_pid_file_if_matches(pid: int) -> None:
+    if PID_FILE.exists() and read_pid() == pid:
+        PID_FILE.unlink()
 
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
 
 
 def start_monitor(interval_seconds: int) -> None:
+    validate_interval_seconds(interval_seconds)
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -273,23 +338,34 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid:
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
-    os.kill(pid, signal.SIGTERM)
+
+    if not is_monitor_process(pid):
+        unlink_pid_file_if_matches(pid)
+        raise SystemExit("monitor is not running")
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        unlink_pid_file_if_matches(pid)
+        raise SystemExit("monitor is not running")
+
     for _ in range(20):
         if not is_pid_running(pid):
-            break
+            unlink_pid_file_if_matches(pid)
+            print(f"stopped monitor (pid={pid})")
+            return
         time.sleep(0.2)
-    if PID_FILE.exists():
-        PID_FILE.unlink()
-    print(f"stopped monitor (pid={pid})")
+
+    raise SystemExit(f"failed to stop monitor (pid={pid}); process is still running")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
@@ -433,7 +509,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     start = sub.add_parser("start", help="Start the background monitor")
-    start.add_argument("--interval", type=int, default=60, help="Sampling interval in seconds")
+    start.add_argument("--interval", type=positive_interval, default=60, help="Sampling interval in seconds")
 
     sub.add_parser("stop", help="Stop the background monitor")
     sub.add_parser("status", help="Show monitor status")
@@ -442,7 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--json", action="store_true", help="Print JSON only")
 
     run_monitor = sub.add_parser("run-monitor", help=argparse.SUPPRESS)
-    run_monitor.add_argument("--interval", type=int, default=60)
+    run_monitor.add_argument("--interval", type=positive_interval, default=60)
 
     report = sub.add_parser("report", help="Summarize one day of logs")
     report.add_argument("target_date", nargs="?", default="today", help="today, yesterday, or YYYY-MM-DD")
