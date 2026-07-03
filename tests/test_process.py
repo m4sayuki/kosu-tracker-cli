@@ -72,6 +72,14 @@ class TestIsKosuMonitorCommand:
         command = "/usr/bin/python3 -m http.server 8000"
         assert is_kosu_monitor_command(command) is False
 
+    def test_kosu_run_monitor_as_arguments_does_not_match(self):
+        command = "/usr/bin/python script.py kosu run-monitor"
+        assert is_kosu_monitor_command(command) is False
+
+    def test_shell_command_with_kosu_arguments_does_not_match(self):
+        command = "/bin/sh -c 'kosu run-monitor'"
+        assert is_kosu_monitor_command(command) is False
+
     def test_unparseable_command_does_not_match(self):
         assert is_kosu_monitor_command("python -m 'unterminated") is False
 

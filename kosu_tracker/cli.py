@@ -262,17 +262,27 @@ def is_kosu_monitor_command(command: str) -> bool:
     except ValueError:
         return False
 
+    if not tokens:
+        return False
+
+    def is_python_executable(token: str) -> bool:
+        return Path(token).name.startswith("python")
+
     for index, token in enumerate(tokens[:-2]):
         if (
             token == "-m"
             and tokens[index + 1] == "kosu_tracker.cli"
             and tokens[index + 2] == "run-monitor"
-            and index > 0
-            and Path(tokens[index - 1]).name.startswith("python")
+            and is_python_executable(tokens[0])
         ):
             return True
 
-    return any(Path(token).name == "kosu" and tokens[index + 1] == "run-monitor" for index, token in enumerate(tokens[:-1]))
+    for index, token in enumerate(tokens[:-1]):
+        if Path(token).name != "kosu" or tokens[index + 1] != "run-monitor":
+            continue
+        if index == 0 or (index == 1 and is_python_executable(tokens[0])):
+            return True
+    return False
 
 
 def is_monitor_process(pid: int) -> bool:
