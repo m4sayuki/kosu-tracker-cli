@@ -65,12 +65,15 @@ def ensure_dirs() -> None:
 
 
 def run_osascript(script: str) -> str:
-    completed = subprocess.run(
-        ["osascript", "-e", script],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(str(exc)) from exc
     if completed.returncode != 0:
         stderr = completed.stderr.strip() or "unknown osascript error"
         raise RuntimeError(stderr)

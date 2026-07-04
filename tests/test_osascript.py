@@ -33,6 +33,12 @@ class TestRunOsascript:
         with pytest.raises(RuntimeError, match="unknown osascript error"):
             run_osascript("dummy script")
 
+    def test_missing_osascript_binary_raises_runtime_error(self, mocker):
+        mock_run = mocker.patch("kosu_tracker.cli.subprocess.run")
+        mock_run.side_effect = FileNotFoundError("osascript")
+        with pytest.raises(RuntimeError, match="osascript"):
+            run_osascript("dummy script")
+
     def test_correct_command_passed_to_subprocess(self, mocker):
         mock_run = mocker.patch("kosu_tracker.cli.subprocess.run")
         mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
