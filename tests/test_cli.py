@@ -20,6 +20,10 @@ class TestBuildParser:
         args = self._parse(["start", "--interval", "30"])
         assert args.interval == 30
 
+    def test_start_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match=r"interval must be positive"):
+            main(["start", "--interval", "0"])
+
     # ── stop ───────────────────────────────────────────────────────────
     def test_stop_command(self):
         args = self._parse(["stop"])
@@ -78,6 +82,10 @@ class TestBuildParser:
     def test_run_monitor_custom_interval(self):
         args = self._parse(["run-monitor", "--interval", "10"])
         assert args.interval == 10
+
+    def test_run_monitor_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match=r"interval must be positive"):
+            main(["run-monitor", "--interval", "0"])
 
     # ── 引数なし → エラー ──────────────────────────────────────────────
     def test_no_subcommand_exits(self):
