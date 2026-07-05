@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -206,7 +207,8 @@ def collect_sample() -> ActivitySample:
 
 def monitor_loop(interval_seconds: int) -> None:
     ensure_dirs()
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    pid = os.getpid()
+    PID_FILE.write_text(str(pid), encoding="utf-8")
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
@@ -222,11 +224,13 @@ def monitor_loop(interval_seconds: int) -> None:
             write_latest(sample)
             time.sleep(interval_seconds)
     finally:
-        if PID_FILE.exists():
+        if PID_FILE.exists() and read_pid() == pid:
             PID_FILE.unlink()
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -238,14 +242,55 @@ def read_pid() -> int | None:
     if not PID_FILE.exists():
         return None
     try:
-        return int(PID_FILE.read_text(encoding="utf-8").strip())
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
     except ValueError:
         return None
+    return pid if pid > 0 else None
+
+
+def process_command(pid: int) -> str | None:
+    if not is_pid_running(pid):
+        return None
+    try:
+        completed = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def is_monitor_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+
+    if "run-monitor" not in tokens:
+        return False
+
+    for index, token in enumerate(tokens[:-2]):
+        if token == "-m" and tokens[index + 1] == "kosu_tracker.cli" and tokens[index + 2] == "run-monitor":
+            return True
+
+    if len(tokens) > 1 and Path(tokens[0]).name == "kosu" and tokens[1] == "run-monitor":
+        return True
+    return len(tokens) > 2 and Path(tokens[1]).name == "kosu" and tokens[2] == "run-monitor"
+
+
+def is_monitor_process(pid: int) -> bool:
+    command = process_command(pid)
+    return bool(command and is_monitor_command(command))
 
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
@@ -273,23 +318,28 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid or not is_monitor_process(pid):
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
-    os.kill(pid, signal.SIGTERM)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
     for _ in range(20):
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
-    if PID_FILE.exists():
+    if is_pid_running(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
+    if PID_FILE.exists() and read_pid() == pid:
         PID_FILE.unlink()
     print(f"stopped monitor (pid={pid})")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
