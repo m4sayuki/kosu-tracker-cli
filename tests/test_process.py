@@ -1,4 +1,4 @@
-"""Tests for read_pid, is_pid_running, require_not_running."""
+"""Tests for monitor process and PID-file handling."""
 from __future__ import annotations
 
 import os
@@ -6,7 +6,15 @@ import os
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import (
+    command_is_monitor_process,
+    is_pid_running,
+    monitor_loop,
+    read_pid,
+    require_not_running,
+    start_monitor,
+    stop_monitor,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -49,9 +57,26 @@ class TestIsPidRunning:
         assert is_pid_running(999_999_999) is False
 
     def test_zero_pid_returns_false(self):
-        # os.kill(0, 0) はプロセスグループ全体に送られるが OSError が出ないケースもある
-        # ここではモックを使って確実にFalseを返すシナリオをテスト
-        assert is_pid_running(999_999_998) is False
+        assert is_pid_running(0) is False
+
+    def test_negative_pid_returns_false(self):
+        assert is_pid_running(-1) is False
+
+
+class TestCommandIsMonitorProcess:
+    def test_python_module_run_monitor_matches(self):
+        command = "/usr/bin/python3 -m kosu_tracker.cli run-monitor --interval 60"
+        assert command_is_monitor_process(command) is True
+
+    def test_console_script_run_monitor_matches(self):
+        command = "/tmp/venv/bin/python /tmp/venv/bin/kosu run-monitor --interval 60"
+        assert command_is_monitor_process(command) is True
+
+    def test_unrelated_process_does_not_match(self):
+        assert command_is_monitor_process("sleep 100") is False
+
+    def test_text_mentioning_run_monitor_does_not_match(self):
+        assert command_is_monitor_process("python -c 'print(\"kosu run-monitor\")'") is False
 
 
 class TestRequireNotRunning:
@@ -63,14 +88,66 @@ class TestRequireNotRunning:
         require_not_running()
         assert not cli_module.PID_FILE.exists()
 
-    def test_active_pid_raises_system_exit(self):
+    def test_active_unrelated_pid_file_is_deleted(self):
         cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
-        with pytest.raises(SystemExit, match=r"monitor is already running"):
-            require_not_running()
+        require_not_running()
+        assert not cli_module.PID_FILE.exists()
 
-    def test_system_exit_message_contains_pid(self):
-        pid = os.getpid()
+    def test_monitor_pid_raises_system_exit(self, monkeypatch):
+        pid = 12345
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: candidate == pid)
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+
+class TestStopMonitor:
+    def test_unrelated_live_pid_is_not_signalled(self, mocker, monkeypatch):
+        cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda pid: False)
+        kill = mocker.patch("kosu_tracker.cli.os.kill")
+
+        with pytest.raises(SystemExit, match="monitor is not running"):
+            stop_monitor()
+
+        kill.assert_not_called()
+        assert not cli_module.PID_FILE.exists()
+
+    def test_pid_file_preserved_when_monitor_does_not_exit(self, mocker, monkeypatch):
+        pid = 12345
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: candidate == pid)
+        monkeypatch.setattr(cli_module, "is_pid_running", lambda candidate: candidate == pid)
+        mocker.patch("kosu_tracker.cli.time.sleep")
+        mocker.patch("kosu_tracker.cli.os.kill")
+
+        with pytest.raises(SystemExit, match="failed to stop monitor"):
+            stop_monitor()
+
+        assert cli_module.PID_FILE.read_text(encoding="utf-8") == str(pid)
+
+    def test_replaced_pid_file_is_not_deleted_after_stop(self, mocker, monkeypatch):
+        pid = 12345
+        replacement_pid = 67890
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: candidate == pid)
+        monkeypatch.setattr(cli_module, "is_pid_running", lambda candidate: False)
+
+        def replace_pid_file(_pid, _signal):
+            cli_module.PID_FILE.write_text(str(replacement_pid), encoding="utf-8")
+
+        mocker.patch("kosu_tracker.cli.os.kill", side_effect=replace_pid_file)
+        stop_monitor()
+
+        assert cli_module.PID_FILE.read_text(encoding="utf-8") == str(replacement_pid)
+
+
+class TestIntervalValidation:
+    def test_start_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match="interval must be a positive"):
+            start_monitor(0)
+
+    def test_monitor_loop_rejects_negative_interval(self):
+        with pytest.raises(SystemExit, match="interval must be a positive"):
+            monitor_loop(-1)
