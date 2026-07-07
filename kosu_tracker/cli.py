@@ -206,6 +206,8 @@ def collect_sample() -> ActivitySample:
 
 
 def monitor_loop(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be positive")
     ensure_dirs()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     keep_running = True
@@ -221,10 +223,12 @@ def monitor_loop(interval_seconds: int) -> None:
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
-            time.sleep(interval_seconds)
+            for _ in range(interval_seconds):
+                if not keep_running:
+                    break
+                time.sleep(1)
     finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        _unlink_pid_file(os.getpid())
 
 
 def is_pid_running(pid: int) -> bool:
@@ -289,15 +293,27 @@ def read_pid() -> int | None:
         return None
 
 
+def _unlink_pid_file(expected_pid: int) -> None:
+    try:
+        if read_pid() == expected_pid:
+            PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
 def require_not_running() -> None:
     pid = read_pid()
     if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
-    if PID_FILE.exists():
+    if pid:
+        _unlink_pid_file(pid)
+    elif PID_FILE.exists():
         PID_FILE.unlink()
 
 
 def start_monitor(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be positive")
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -328,8 +344,9 @@ def stop_monitor() -> None:
         if not is_pid_running(pid):
             break
         time.sleep(0.2)
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    if is_pid_running(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
+    _unlink_pid_file(pid)
     print(f"stopped monitor (pid={pid})")
 
 

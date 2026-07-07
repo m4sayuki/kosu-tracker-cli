@@ -7,7 +7,7 @@ import signal
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running, stop_monitor
+from kosu_tracker.cli import is_pid_running, monitor_loop, read_pid, require_not_running, start_monitor, stop_monitor
 
 
 @pytest.fixture(autouse=True)
@@ -107,3 +107,46 @@ class TestStopMonitor:
         stop_monitor()
 
         kill.assert_called_once_with(pid, signal.SIGTERM)
+
+    def test_stop_preserves_replaced_pid_file(self, monkeypatch, mocker):
+        pid = os.getpid()
+        replacement_pid = pid + 1
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda actual_pid: actual_pid == pid)
+        monkeypatch.setattr(cli_module, "is_pid_running", lambda actual_pid: False)
+
+        def replace_pid_file(actual_pid, actual_signal):
+            cli_module.PID_FILE.write_text(str(replacement_pid), encoding="utf-8")
+
+        mocker.patch("kosu_tracker.cli.os.kill", side_effect=replace_pid_file)
+
+        stop_monitor()
+
+        assert cli_module.PID_FILE.read_text(encoding="utf-8") == str(replacement_pid)
+
+    def test_stop_failure_preserves_pid_file(self, monkeypatch, mocker):
+        pid = os.getpid()
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda actual_pid: actual_pid == pid)
+        monkeypatch.setattr(cli_module, "is_pid_running", lambda actual_pid: True)
+        mocker.patch("kosu_tracker.cli.os.kill")
+        mocker.patch("kosu_tracker.cli.time.sleep")
+
+        with pytest.raises(SystemExit, match=r"failed to stop monitor"):
+            stop_monitor()
+
+        assert cli_module.PID_FILE.read_text(encoding="utf-8") == str(pid)
+
+
+class TestMonitorIntervalValidation:
+    def test_start_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match=r"interval must be positive"):
+            start_monitor(0)
+
+    def test_run_monitor_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match=r"interval must be positive"):
+            monitor_loop(0)
+
+    def test_run_monitor_rejects_negative_interval(self):
+        with pytest.raises(SystemExit, match=r"interval must be positive"):
+            monitor_loop(-1)
