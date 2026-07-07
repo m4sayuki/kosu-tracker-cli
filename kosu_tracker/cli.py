@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -227,11 +228,56 @@ def monitor_loop(interval_seconds: int) -> None:
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def _pid_command(pid: int) -> str | None:
+    if pid <= 0:
+        return None
+    try:
+        completed = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def _looks_like_monitor_command(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+
+    executable = Path(tokens[0]).name
+    if executable == "kosu":
+        return len(tokens) >= 2 and tokens[1] == "run-monitor"
+
+    if not executable.startswith("python"):
+        return False
+    if len(tokens) >= 4 and tokens[1] == "-m" and tokens[2] == "kosu_tracker.cli":
+        return tokens[3] == "run-monitor"
+    if len(tokens) >= 3 and Path(tokens[1]).name == "kosu":
+        return tokens[2] == "run-monitor"
+    return False
+
+
+def is_monitor_process(pid: int) -> bool:
+    command = _pid_command(pid)
+    return bool(command and _looks_like_monitor_command(command))
 
 
 def read_pid() -> int | None:
@@ -245,7 +291,7 @@ def read_pid() -> int | None:
 
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
@@ -273,7 +319,7 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
+    if not pid or not is_monitor_process(pid):
         if PID_FILE.exists():
             PID_FILE.unlink()
         raise SystemExit("monitor is not running")
@@ -289,7 +335,7 @@ def stop_monitor() -> None:
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
