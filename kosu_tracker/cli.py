@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -204,7 +205,13 @@ def collect_sample() -> ActivitySample:
     )
 
 
+def validate_positive_interval(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("interval must be a positive integer")
+
+
 def monitor_loop(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds)
     ensure_dirs()
     PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
     keep_running = True
@@ -222,16 +229,69 @@ def monitor_loop(interval_seconds: int) -> None:
             write_latest(sample)
             time.sleep(interval_seconds)
     finally:
-        if PID_FILE.exists():
+        if pid_file_contains(os.getpid()):
             PID_FILE.unlink()
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def command_for_pid(pid: int) -> list[str] | None:
+    if not is_pid_running(pid):
+        return None
+    completed = subprocess.run(
+        ["ps", "-ww", "-p", str(pid), "-o", "command="],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return None
+    command = completed.stdout.strip()
+    if not command:
+        return None
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return None
+
+
+def _is_python_executable(token: str) -> bool:
+    name = Path(token).name.lower()
+    return name.startswith("python")
+
+
+def _is_kosu_executable(token: str) -> bool:
+    return Path(token).name == "kosu"
+
+
+def is_monitor_command(tokens: list[str]) -> bool:
+    if not tokens:
+        return False
+
+    if _is_kosu_executable(tokens[0]):
+        return len(tokens) >= 2 and tokens[1] == "run-monitor"
+
+    if not _is_python_executable(tokens[0]):
+        return False
+
+    for index, token in enumerate(tokens[:-2]):
+        if token == "-m" and tokens[index + 1] == "kosu_tracker.cli":
+            return tokens[index + 2] == "run-monitor"
+
+    return len(tokens) >= 3 and _is_kosu_executable(tokens[1]) and tokens[2] == "run-monitor"
+
+
+def is_monitor_process(pid: int) -> bool:
+    command = command_for_pid(pid)
+    return bool(command and is_monitor_command(command))
 
 
 def read_pid() -> int | None:
@@ -243,15 +303,29 @@ def read_pid() -> int | None:
         return None
 
 
+def pid_file_contains(pid: int) -> bool:
+    return read_pid() == pid
+
+
+def unlink_pid_file_for(pid: int | None) -> None:
+    if pid is None:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+        return
+    if pid_file_contains(pid):
+        PID_FILE.unlink()
+
+
 def require_not_running() -> None:
     pid = read_pid()
-    if pid and is_pid_running(pid):
+    if pid and is_monitor_process(pid):
         raise SystemExit(f"monitor is already running (pid={pid})")
     if PID_FILE.exists():
         PID_FILE.unlink()
 
 
 def start_monitor(interval_seconds: int) -> None:
+    validate_positive_interval(interval_seconds)
     ensure_dirs()
     require_not_running()
     env = os.environ.copy()
@@ -265,7 +339,7 @@ def start_monitor(interval_seconds: int) -> None:
     )
     time.sleep(1)
     pid = read_pid()
-    if not pid:
+    if not pid or not is_monitor_process(pid):
         raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
     print(f"started monitor (pid={pid})")
     print(f"log directory: {LOG_DIR}")
@@ -273,23 +347,23 @@ def start_monitor(interval_seconds: int) -> None:
 
 def stop_monitor() -> None:
     pid = read_pid()
-    if not pid or not is_pid_running(pid):
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+    if not pid or not is_monitor_process(pid):
+        unlink_pid_file_for(pid)
         raise SystemExit("monitor is not running")
     os.kill(pid, signal.SIGTERM)
     for _ in range(20):
-        if not is_pid_running(pid):
+        if not is_monitor_process(pid):
             break
         time.sleep(0.2)
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    if is_monitor_process(pid):
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
+    unlink_pid_file_for(pid)
     print(f"stopped monitor (pid={pid})")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
+    running = bool(pid and is_monitor_process(pid))
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")
