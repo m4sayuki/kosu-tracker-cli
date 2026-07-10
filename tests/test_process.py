@@ -123,6 +123,7 @@ class TestStopMonitor:
         pid = os.getpid()
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
         monkeypatch.setattr(cli_module, "is_monitor_process", lambda candidate: False)
+        monkeypatch.setattr(cli_module, "is_pid_running", lambda candidate: True)
         mock_kill = mocker.patch("kosu_tracker.cli.os.kill")
 
         with pytest.raises(SystemExit, match="refusing to stop"):
