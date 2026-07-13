@@ -2,11 +2,21 @@
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
 
 import pytest
 
 import kosu_tracker.cli as cli_module
-from kosu_tracker.cli import is_pid_running, read_pid, require_not_running
+from kosu_tracker.cli import (
+    is_monitor_process,
+    is_pid_running,
+    monitor_loop,
+    read_pid,
+    require_not_running,
+    start_monitor,
+    stop_monitor,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -49,9 +59,40 @@ class TestIsPidRunning:
         assert is_pid_running(999_999_999) is False
 
     def test_zero_pid_returns_false(self):
-        # os.kill(0, 0) はプロセスグループ全体に送られるが OSError が出ないケースもある
-        # ここではモックを使って確実にFalseを返すシナリオをテスト
-        assert is_pid_running(999_999_998) is False
+        assert is_pid_running(0) is False
+
+    def test_negative_pid_returns_false(self):
+        assert is_pid_running(-1) is False
+
+
+class TestIsMonitorProcess:
+    def test_python_module_run_monitor_is_recognized(self, mocker):
+        mocker.patch("kosu_tracker.cli.os.kill")
+        mocker.patch(
+            "kosu_tracker.cli.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["ps"],
+                returncode=0,
+                stdout="/usr/bin/python3 -m kosu_tracker.cli run-monitor --interval 60\n",
+                stderr="",
+            ),
+        )
+
+        assert is_monitor_process(12345) is True
+
+    def test_unrelated_python_process_is_not_monitor(self, mocker):
+        mocker.patch("kosu_tracker.cli.os.kill")
+        mocker.patch(
+            "kosu_tracker.cli.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=["ps"],
+                returncode=0,
+                stdout="/usr/bin/python3 -m pytest\n",
+                stderr="",
+            ),
+        )
+
+        assert is_monitor_process(12345) is False
 
 
 class TestRequireNotRunning:
@@ -63,14 +104,59 @@ class TestRequireNotRunning:
         require_not_running()
         assert not cli_module.PID_FILE.exists()
 
-    def test_active_pid_raises_system_exit(self):
+    def test_unrelated_live_pid_file_is_deleted(self):
         cli_module.PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+        require_not_running()
+        assert not cli_module.PID_FILE.exists()
+
+    def test_active_monitor_pid_raises_system_exit(self, monkeypatch):
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda pid: True)
+        cli_module.PID_FILE.write_text("12345", encoding="utf-8")
         with pytest.raises(SystemExit, match=r"monitor is already running"):
             require_not_running()
 
-    def test_system_exit_message_contains_pid(self):
-        pid = os.getpid()
+    def test_system_exit_message_contains_pid(self, monkeypatch):
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda pid: True)
+        pid = 12345
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
         with pytest.raises(SystemExit) as exc_info:
             require_not_running()
         assert str(pid) in str(exc_info.value)
+
+
+class TestStopMonitor:
+    def test_unrelated_live_pid_is_not_signalled(self, mocker):
+        pid = os.getpid()
+        cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
+
+        def fake_kill(target_pid: int, sig: int) -> None:
+            if sig == signal.SIGTERM:
+                raise AssertionError("SIGTERM should not be sent to unrelated processes")
+
+        mocker.patch("kosu_tracker.cli.os.kill", side_effect=fake_kill)
+
+        with pytest.raises(SystemExit, match="monitor is not running"):
+            stop_monitor()
+
+        assert not cli_module.PID_FILE.exists()
+
+    def test_monitor_pid_is_signalled_and_unlinked(self, mocker, monkeypatch):
+        cli_module.PID_FILE.write_text("12345", encoding="utf-8")
+        monitor_checks = iter([True, False])
+        monkeypatch.setattr(cli_module, "is_monitor_process", lambda pid: next(monitor_checks))
+        kill_mock = mocker.patch("kosu_tracker.cli.os.kill")
+
+        stop_monitor()
+
+        kill_mock.assert_called_once_with(12345, signal.SIGTERM)
+        assert not cli_module.PID_FILE.exists()
+
+
+class TestIntervalValidation:
+    def test_start_monitor_rejects_zero_interval(self):
+        with pytest.raises(SystemExit, match="positive"):
+            start_monitor(0)
+
+    def test_run_monitor_rejects_negative_interval(self):
+        with pytest.raises(SystemExit, match="positive"):
+            monitor_loop(-1)
