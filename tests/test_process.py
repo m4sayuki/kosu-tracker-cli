@@ -117,6 +117,17 @@ class TestMonitorLock:
         sleep.assert_called_once_with(0.05)
         release.assert_called_once_with(lock)
 
+    def test_waiting_monitor_exits_after_observing_active_instance(self, mocker):
+        cli_module.PID_FILE.write_text("12345 token-a\n", encoding="utf-8")
+        acquire = mocker.patch("kosu_tracker.cli.try_acquire_monitor_lock", return_value=None)
+        sleep = mocker.patch("kosu_tracker.cli.time.sleep")
+
+        with pytest.raises(SystemExit, match=r"already running \(pid=12345\)"):
+            cli_module.monitor_loop(1)
+
+        acquire.assert_called_once_with()
+        sleep.assert_not_called()
+
 
 class TestRequireNotRunning:
     def test_no_pid_file_passes_without_error(self):

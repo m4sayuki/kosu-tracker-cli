@@ -218,6 +218,9 @@ def monitor_loop(interval_seconds: int) -> None:
         lock = try_acquire_monitor_lock()
         if lock is not None:
             break
+        state = read_monitor_state()
+        if state and state[1]:
+            raise SystemExit(f"monitor is already running (pid={state[0]})")
         time.sleep(0.05)
     if lock is None:
         raise SystemExit("monitor is already running")
