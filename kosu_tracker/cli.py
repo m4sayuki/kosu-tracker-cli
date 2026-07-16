@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
-import shlex
+import secrets
 import signal
 import subprocess
 import sys
@@ -22,6 +23,8 @@ APP_DIR = Path(os.environ.get("KOSU_TRACKER_HOME", Path.home() / ".local" / "sha
 LOG_DIR = APP_DIR / "logs"
 STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
+LOCK_FILE = STATE_DIR / "monitor.lock"
+STOP_FILE = STATE_DIR / "monitor.stop"
 LATEST_FILE = STATE_DIR / "latest.json"
 KNOWN_BROWSERS = {
     "Google Chrome",
@@ -210,8 +213,14 @@ def monitor_loop(interval_seconds: int) -> None:
         raise SystemExit("monitor interval must be greater than 0")
 
     ensure_dirs()
+    lock = try_acquire_monitor_lock()
+    if lock is None:
+        raise SystemExit("monitor is already running")
+
     pid = os.getpid()
-    PID_FILE.write_text(str(pid), encoding="utf-8")
+    token = secrets.token_hex(16)
+    clear_stop_request()
+    write_monitor_state(pid, token)
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
@@ -221,18 +230,19 @@ def monitor_loop(interval_seconds: int) -> None:
     signal.signal(signal.SIGTERM, handle_term)
     signal.signal(signal.SIGINT, handle_term)
     try:
-        while keep_running:
+        while keep_running and not stop_requested(token):
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
             remaining = float(interval_seconds)
-            while keep_running and remaining > 0:
+            while keep_running and remaining > 0 and not stop_requested(token):
                 nap = min(0.2, remaining)
                 time.sleep(nap)
                 remaining -= nap
     finally:
-        if pid_file_matches(pid):
-            PID_FILE.unlink()
+        unlink_monitor_state_if_matches(pid, token)
+        clear_stop_request(token)
+        release_monitor_lock(lock)
 
 
 def is_pid_running(pid: int) -> bool:
@@ -245,78 +255,93 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
-def command_for_pid(pid: int) -> str | None:
-    if not is_pid_running(pid):
-        return None
+def try_acquire_monitor_lock() -> Any | None:
+    ensure_dirs()
     try:
-        completed = subprocess.run(
-            ["ps", "-ww", "-p", str(pid), "-o", "command="],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
+        lock = LOCK_FILE.open("a+", encoding="utf-8")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        if "lock" in locals():
+            lock.close()
         return None
-    if completed.returncode != 0:
-        return None
-    return completed.stdout.strip() or None
+    return lock
 
 
-def is_kosu_monitor_command(command: str) -> bool:
+def release_monitor_lock(lock: Any) -> None:
     try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-
-    is_python = Path(tokens[0]).name.startswith("python")
-    if is_python and tokens[1:4] == ["-m", "kosu_tracker.cli", "run-monitor"]:
-        return True
-
-    for index, token in enumerate(tokens[:-1]):
-        if Path(token).name != "kosu" or tokens[index + 1] != "run-monitor":
-            continue
-        if index == 0 or (index == 1 and is_python):
-            return True
-    return False
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock.close()
 
 
-def is_monitor_process(pid: int) -> bool:
-    command = command_for_pid(pid)
-    return bool(command and is_kosu_monitor_command(command))
-
-
-def read_pid() -> int | None:
+def read_monitor_state() -> tuple[int, str | None] | None:
     if not PID_FILE.exists():
         return None
     try:
-        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+        parts = PID_FILE.read_text(encoding="utf-8").split()
+        pid = int(parts[0])
+    except (IndexError, OSError, ValueError):
         return None
-    return pid if pid > 0 else None
+    if pid <= 0:
+        return None
+    token = parts[1] if len(parts) == 2 else None
+    return pid, token
 
 
-def pid_file_matches(pid: int) -> bool:
-    return read_pid() == pid
+def read_pid() -> int | None:
+    state = read_monitor_state()
+    return state[0] if state else None
 
 
-def unlink_pid_file_if_matches(pid: int) -> None:
-    if pid_file_matches(pid):
-        try:
-            PID_FILE.unlink()
-        except FileNotFoundError:
-            pass
+def write_monitor_state(pid: int, token: str) -> None:
+    temporary = PID_FILE.with_name(f".{PID_FILE.name}.{pid}")
+    temporary.write_text(f"{pid} {token}\n", encoding="utf-8")
+    os.replace(temporary, PID_FILE)
+
+
+def unlink_monitor_state_if_matches(pid: int, token: str) -> None:
+    if read_monitor_state() != (pid, token):
+        return
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def stop_requested(token: str) -> bool:
+    try:
+        return STOP_FILE.read_text(encoding="utf-8").strip() == token
+    except OSError:
+        return False
+
+
+def clear_stop_request(token: str | None = None) -> None:
+    if token is not None and not stop_requested(token):
+        return
+    try:
+        STOP_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def monitor_is_running() -> bool:
+    lock = try_acquire_monitor_lock()
+    if lock is None:
+        return True
+    release_monitor_lock(lock)
+    return False
 
 
 def require_not_running() -> None:
-    pid = read_pid()
-    if pid and is_monitor_process(pid):
+    lock = try_acquire_monitor_lock()
+    if lock is None:
+        pid = read_pid()
         raise SystemExit(f"monitor is already running (pid={pid})")
-    if pid:
-        unlink_pid_file_if_matches(pid)
-    elif PID_FILE.exists():
-        PID_FILE.unlink()
+    try:
+        PID_FILE.unlink(missing_ok=True)
+        clear_stop_request()
+    finally:
+        release_monitor_lock(lock)
 
 
 def start_monitor(interval_seconds: int) -> None:
@@ -335,44 +360,50 @@ def start_monitor(interval_seconds: int) -> None:
         env=env,
     )
     time.sleep(1)
-    pid = read_pid()
-    if not pid or not is_monitor_process(pid):
+    state = read_monitor_state()
+    if not state or not state[1] or not monitor_is_running():
         raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
+    pid, _ = state
     print(f"started monitor (pid={pid})")
     print(f"log directory: {LOG_DIR}")
 
 
 def stop_monitor() -> None:
-    pid = read_pid()
-    if not pid:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+    state = read_monitor_state()
+    if not state or not state[1] or not monitor_is_running():
+        lock = try_acquire_monitor_lock()
+        if lock is not None:
+            try:
+                PID_FILE.unlink(missing_ok=True)
+                clear_stop_request()
+            finally:
+                release_monitor_lock(lock)
         raise SystemExit("monitor is not running")
 
-    if not is_monitor_process(pid):
-        unlink_pid_file_if_matches(pid)
-        raise SystemExit("monitor is not running")
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        unlink_pid_file_if_matches(pid)
-        raise SystemExit("monitor is not running") from None
+    pid, token = state
+    STOP_FILE.write_text(f"{token}\n", encoding="utf-8")
 
     for _ in range(20):
-        if not is_monitor_process(pid):
+        current = read_monitor_state()
+        if current != state or not monitor_is_running():
             break
         time.sleep(0.2)
     else:
         raise SystemExit(f"failed to stop monitor (pid={pid})")
 
-    unlink_pid_file_if_matches(pid)
+    cleanup_lock = try_acquire_monitor_lock()
+    if cleanup_lock is not None:
+        try:
+            unlink_monitor_state_if_matches(pid, token)
+            clear_stop_request(token)
+        finally:
+            release_monitor_lock(cleanup_lock)
     print(f"stopped monitor (pid={pid})")
 
 
 def print_status() -> None:
     pid = read_pid()
-    running = bool(pid and is_monitor_process(pid))
+    running = monitor_is_running()
     print(f"running: {'yes' if running else 'no'}")
     if running:
         print(f"pid: {pid}")

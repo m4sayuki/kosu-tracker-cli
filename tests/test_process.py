@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import os
-import signal
 
 import pytest
 
 import kosu_tracker.cli as cli_module
 from kosu_tracker.cli import (
-    is_kosu_monitor_command,
     is_pid_running,
     read_pid,
     require_not_running,
@@ -22,6 +20,8 @@ def patch_state_dir(tmp_path, monkeypatch):
     pid_file = state_dir / "monitor.pid"
     monkeypatch.setattr(cli_module, "STATE_DIR", state_dir)
     monkeypatch.setattr(cli_module, "PID_FILE", pid_file)
+    monkeypatch.setattr(cli_module, "LOCK_FILE", state_dir / "monitor.lock")
+    monkeypatch.setattr(cli_module, "STOP_FILE", state_dir / "monitor.stop")
     return pid_file
 
 
@@ -32,6 +32,11 @@ class TestReadPid:
     def test_valid_pid_file_returns_int(self, tmp_path):
         cli_module.PID_FILE.write_text("12345", encoding="utf-8")
         assert read_pid() == 12345
+
+    def test_pid_with_instance_token_returns_int(self):
+        cli_module.PID_FILE.write_text("12345 abcdef\n", encoding="utf-8")
+        assert read_pid() == 12345
+        assert cli_module.read_monitor_state() == (12345, "abcdef")
 
     def test_pid_file_with_whitespace(self):
         cli_module.PID_FILE.write_text("  99  \n", encoding="utf-8")
@@ -66,30 +71,23 @@ class TestIsPidRunning:
         kill_mock.assert_not_called()
 
 
-class TestIsKosuMonitorCommand:
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "/usr/bin/python3 -m kosu_tracker.cli run-monitor --interval 60",
-            "/usr/local/bin/kosu run-monitor --interval 60",
-            "/workspace/.venv/bin/python /workspace/.venv/bin/kosu run-monitor",
-        ],
-    )
-    def test_monitor_commands_match(self, command):
-        assert is_kosu_monitor_command(command) is True
+class TestMonitorLock:
+    def test_second_owner_cannot_acquire_lock(self):
+        first = cli_module.try_acquire_monitor_lock()
+        assert first is not None
+        try:
+            assert cli_module.try_acquire_monitor_lock() is None
+        finally:
+            cli_module.release_monitor_lock(first)
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "/usr/bin/python3 -m http.server 8000",
-            "/usr/bin/python3 script.py kosu run-monitor",
-            "/usr/bin/python3 script.py -m kosu_tracker.cli run-monitor",
-            "/bin/sh -c 'kosu run-monitor'",
-            "python -m 'unterminated",
-        ],
-    )
-    def test_unrelated_commands_do_not_match(self, command):
-        assert is_kosu_monitor_command(command) is False
+    def test_lock_is_available_after_release(self):
+        first = cli_module.try_acquire_monitor_lock()
+        assert first is not None
+        cli_module.release_monitor_lock(first)
+
+        second = cli_module.try_acquire_monitor_lock()
+        assert second is not None
+        cli_module.release_monitor_lock(second)
 
 
 class TestRequireNotRunning:
@@ -106,18 +104,26 @@ class TestRequireNotRunning:
         require_not_running()
         assert not cli_module.PID_FILE.exists()
 
-    def test_active_monitor_pid_raises_system_exit(self, mocker):
-        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
+    def test_active_monitor_pid_raises_system_exit(self):
         cli_module.PID_FILE.write_text("12345", encoding="utf-8")
-        with pytest.raises(SystemExit, match=r"monitor is already running"):
-            require_not_running()
+        lock = cli_module.try_acquire_monitor_lock()
+        assert lock is not None
+        try:
+            with pytest.raises(SystemExit, match=r"monitor is already running"):
+                require_not_running()
+        finally:
+            cli_module.release_monitor_lock(lock)
 
-    def test_system_exit_message_contains_pid(self, mocker):
-        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
+    def test_system_exit_message_contains_pid(self):
         pid = 12345
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
-        with pytest.raises(SystemExit) as exc_info:
-            require_not_running()
+        lock = cli_module.try_acquire_monitor_lock()
+        assert lock is not None
+        try:
+            with pytest.raises(SystemExit) as exc_info:
+                require_not_running()
+        finally:
+            cli_module.release_monitor_lock(lock)
         assert str(pid) in str(exc_info.value)
 
 
@@ -125,12 +131,12 @@ class TestStopMonitor:
     def test_unrelated_live_pid_is_not_signalled(self, mocker):
         pid = os.getpid()
         cli_module.PID_FILE.write_text(str(pid), encoding="utf-8")
-        kill_mock = mocker.patch("kosu_tracker.cli.os.kill", wraps=os.kill)
+        kill_mock = mocker.patch("kosu_tracker.cli.os.kill")
 
         with pytest.raises(SystemExit, match="monitor is not running"):
             cli_module.stop_monitor()
 
-        assert all(call.args[1] != signal.SIGTERM for call in kill_mock.call_args_list)
+        kill_mock.assert_not_called()
         assert not cli_module.PID_FILE.exists()
 
     def test_negative_pid_is_not_signalled(self, mocker):
@@ -143,45 +149,46 @@ class TestStopMonitor:
         kill_mock.assert_not_called()
         assert not cli_module.PID_FILE.exists()
 
-    def test_monitor_pid_is_signalled_and_unlinked(self, mocker):
-        cli_module.PID_FILE.write_text("12345", encoding="utf-8")
+    def test_monitor_receives_stop_request_without_signal(self, mocker):
+        cli_module.PID_FILE.write_text("12345 token-a\n", encoding="utf-8")
         mocker.patch(
-            "kosu_tracker.cli.is_monitor_process",
+            "kosu_tracker.cli.monitor_is_running",
             side_effect=[True, False],
         )
         kill_mock = mocker.patch("kosu_tracker.cli.os.kill")
 
         cli_module.stop_monitor()
 
-        kill_mock.assert_called_once_with(12345, signal.SIGTERM)
+        kill_mock.assert_not_called()
         assert not cli_module.PID_FILE.exists()
+        assert not cli_module.STOP_FILE.exists()
 
-    def test_replacement_pid_file_is_preserved(self, mocker):
-        cli_module.PID_FILE.write_text("12345", encoding="utf-8")
-        mocker.patch(
-            "kosu_tracker.cli.is_monitor_process",
-            side_effect=[True, False],
-        )
+    def test_replacement_monitor_state_is_preserved(self, mocker):
+        cli_module.PID_FILE.write_text("12345 token-a\n", encoding="utf-8")
+        checks = iter([True, False])
 
-        def replace_pid_file(pid, signum):
-            cli_module.PID_FILE.write_text("67890", encoding="utf-8")
+        def monitor_running():
+            running = next(checks)
+            if not running:
+                cli_module.PID_FILE.write_text("67890 token-b\n", encoding="utf-8")
+            return running
 
-        mocker.patch("kosu_tracker.cli.os.kill", side_effect=replace_pid_file)
+        mocker.patch("kosu_tracker.cli.monitor_is_running", side_effect=monitor_running)
 
         cli_module.stop_monitor()
 
-        assert cli_module.PID_FILE.read_text(encoding="utf-8") == "67890"
+        assert cli_module.PID_FILE.read_text(encoding="utf-8") == "67890 token-b\n"
 
     def test_pid_file_is_preserved_if_monitor_does_not_stop(self, mocker):
-        cli_module.PID_FILE.write_text("12345", encoding="utf-8")
-        mocker.patch("kosu_tracker.cli.is_monitor_process", return_value=True)
-        mocker.patch("kosu_tracker.cli.os.kill")
+        cli_module.PID_FILE.write_text("12345 token-a\n", encoding="utf-8")
+        mocker.patch("kosu_tracker.cli.monitor_is_running", return_value=True)
         mocker.patch("kosu_tracker.cli.time.sleep")
 
         with pytest.raises(SystemExit, match="failed to stop monitor"):
             cli_module.stop_monitor()
 
-        assert cli_module.PID_FILE.read_text(encoding="utf-8") == "12345"
+        assert cli_module.PID_FILE.read_text(encoding="utf-8") == "12345 token-a\n"
+        assert cli_module.STOP_FILE.read_text(encoding="utf-8").strip() == "token-a"
 
 
 class TestIntervalValidation:
