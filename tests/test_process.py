@@ -22,6 +22,7 @@ def patch_state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_module, "PID_FILE", pid_file)
     monkeypatch.setattr(cli_module, "LOCK_FILE", state_dir / "monitor.lock")
     monkeypatch.setattr(cli_module, "CONTROL_LOCK_FILE", state_dir / "control.lock")
+    monkeypatch.setattr(cli_module, "GENERATION_FILE", state_dir / "monitor.generation")
     monkeypatch.setattr(cli_module, "STOP_FILE", state_dir / "monitor.stop")
     return pid_file
 
@@ -170,6 +171,7 @@ class TestStopMonitor:
 
         kill_mock.assert_not_called()
         assert not cli_module.PID_FILE.exists()
+        assert cli_module.read_generation() is not None
 
     def test_monitor_receives_stop_request_without_signal(self, mocker):
         cli_module.PID_FILE.write_text("12345 token-a\n", encoding="utf-8")
@@ -227,3 +229,24 @@ class TestIntervalValidation:
             cli_module.monitor_loop(-1)
 
         assert not cli_module.PID_FILE.exists()
+
+
+class TestStartGeneration:
+    def test_superseded_start_does_not_spawn(self, mocker):
+        real_acquire = cli_module.acquire_control_lock
+
+        def advance_before_acquiring():
+            lock = real_acquire()
+            cli_module.advance_generation()
+            return lock
+
+        mocker.patch(
+            "kosu_tracker.cli.acquire_control_lock",
+            side_effect=advance_before_acquiring,
+        )
+        popen = mocker.patch("kosu_tracker.cli.subprocess.Popen")
+
+        with pytest.raises(SystemExit, match="superseded"):
+            cli_module.start_monitor(1)
+
+        popen.assert_not_called()

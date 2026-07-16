@@ -25,6 +25,7 @@ STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
 LOCK_FILE = STATE_DIR / "monitor.lock"
 CONTROL_LOCK_FILE = STATE_DIR / "control.lock"
+GENERATION_FILE = STATE_DIR / "monitor.generation"
 STOP_FILE = STATE_DIR / "monitor.stop"
 LATEST_FILE = STATE_DIR / "latest.json"
 KNOWN_BROWSERS = {
@@ -302,6 +303,22 @@ def acquire_control_lock() -> Any:
     return lock
 
 
+def read_generation() -> str | None:
+    try:
+        generation = GENERATION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return generation or None
+
+
+def advance_generation() -> str:
+    generation = secrets.token_hex(16)
+    temporary = GENERATION_FILE.with_name(f".{GENERATION_FILE.name}.{os.getpid()}")
+    temporary.write_text(f"{generation}\n", encoding="utf-8")
+    os.replace(temporary, GENERATION_FILE)
+    return generation
+
+
 def read_monitor_state() -> tuple[int, str | None] | None:
     if not PID_FILE.exists():
         return None
@@ -381,13 +398,18 @@ def start_monitor(interval_seconds: int) -> None:
         raise SystemExit("monitor interval must be greater than 0")
 
     ensure_dirs()
+    observed_generation = read_generation()
     control_lock = acquire_control_lock()
     monitor_lock = None
     try:
+        if read_generation() != observed_generation:
+            raise SystemExit("start request was superseded by another monitor command")
+
         monitor_lock = try_acquire_monitor_lock()
         if monitor_lock is None:
             raise SystemExit(f"monitor is already running (pid={read_pid()})")
 
+        advance_generation()
         PID_FILE.unlink(missing_ok=True)
         clear_stop_request()
         lock_fd = monitor_lock.fileno()
@@ -462,6 +484,7 @@ def _stop_monitor() -> None:
 def stop_monitor() -> None:
     control_lock = acquire_control_lock()
     try:
+        advance_generation()
         _stop_monitor()
     finally:
         release_monitor_lock(control_lock)
