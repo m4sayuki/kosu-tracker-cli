@@ -210,22 +210,27 @@ def collect_sample() -> ActivitySample:
     )
 
 
-def monitor_loop(interval_seconds: int, lock_fd: int | None = None) -> None:
+def monitor_loop(
+    interval_seconds: int,
+    lock_fd: int | None = None,
+    generation: str | None = None,
+) -> None:
     if interval_seconds <= 0:
         raise SystemExit("monitor interval must be greater than 0")
 
     ensure_dirs()
-    control_lock = None
+    control_lock = acquire_control_lock()
     if lock_fd is None:
-        control_lock = acquire_control_lock()
         lock = try_acquire_monitor_lock()
         if lock is None:
             release_monitor_lock(control_lock)
             raise SystemExit("monitor is already running")
+        generation = advance_generation()
     else:
         try:
             lock = os.fdopen(lock_fd, "a+", encoding="utf-8")
         except OSError as exc:
+            release_monitor_lock(control_lock)
             raise SystemExit("invalid inherited monitor lock") from exc
 
     pid = os.getpid()
@@ -237,6 +242,8 @@ def monitor_loop(interval_seconds: int, lock_fd: int | None = None) -> None:
         keep_running = False
 
     try:
+        if generation is None or read_generation() != generation:
+            raise SystemExit("monitor start request is no longer current")
         clear_stop_request()
         write_monitor_state(pid, token)
         if control_lock is not None:
@@ -409,7 +416,7 @@ def start_monitor(interval_seconds: int) -> None:
         if monitor_lock is None:
             raise SystemExit(f"monitor is already running (pid={read_pid()})")
 
-        advance_generation()
+        generation = advance_generation()
         PID_FILE.unlink(missing_ok=True)
         clear_stop_request()
         lock_fd = monitor_lock.fileno()
@@ -424,6 +431,8 @@ def start_monitor(interval_seconds: int) -> None:
                 str(interval_seconds),
                 "--lock-fd",
                 str(lock_fd),
+                "--generation",
+                generation,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -434,18 +443,25 @@ def start_monitor(interval_seconds: int) -> None:
         )
         monitor_lock.close()
         monitor_lock = None
+        release_monitor_lock(control_lock)
+        control_lock = None
 
         time.sleep(1)
+        control_lock = acquire_control_lock()
         state = read_monitor_state()
-        if not state or not state[1] or not monitor_is_running():
+        if state and state[1] and monitor_is_running():
+            pid, _ = state
+            print(f"started monitor (pid={pid})")
+            print(f"log directory: {LOG_DIR}")
+        else:
+            if read_generation() == generation:
+                advance_generation()
             raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
-        pid, _ = state
-        print(f"started monitor (pid={pid})")
-        print(f"log directory: {LOG_DIR}")
     finally:
         if monitor_lock is not None:
             release_monitor_lock(monitor_lock)
-        release_monitor_lock(control_lock)
+        if control_lock is not None:
+            release_monitor_lock(control_lock)
 
 
 def _stop_monitor() -> None:
@@ -651,6 +667,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_monitor = sub.add_parser("run-monitor", help=argparse.SUPPRESS)
     run_monitor.add_argument("--interval", type=int, default=60)
     run_monitor.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)
+    run_monitor.add_argument("--generation", help=argparse.SUPPRESS)
 
     report = sub.add_parser("report", help="Summarize one day of logs")
     report.add_argument("target_date", nargs="?", default="today", help="today, yesterday, or YYYY-MM-DD")
@@ -685,7 +702,11 @@ def main(argv: list[str] | None = None) -> None:
         if args.lock_fd is None:
             monitor_loop(interval_seconds=args.interval)
         else:
-            monitor_loop(interval_seconds=args.interval, lock_fd=args.lock_fd)
+            monitor_loop(
+                interval_seconds=args.interval,
+                lock_fd=args.lock_fd,
+                generation=args.generation,
+            )
         return
     if args.command == "report":
         report_day(

@@ -250,3 +250,17 @@ class TestStartGeneration:
             cli_module.start_monitor(1)
 
         popen.assert_not_called()
+
+    def test_inherited_child_rejects_stale_generation(self):
+        lock = cli_module.try_acquire_monitor_lock()
+        assert lock is not None
+        generation = cli_module.advance_generation()
+        inherited_fd = os.dup(lock.fileno())
+        cli_module.advance_generation()
+        try:
+            with pytest.raises(SystemExit, match="no longer current"):
+                cli_module.monitor_loop(1, lock_fd=inherited_fd, generation=generation)
+        finally:
+            lock.close()
+
+        assert not cli_module.PID_FILE.exists()

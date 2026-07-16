@@ -80,8 +80,9 @@ class TestBuildParser:
         assert args.interval == 10
 
     def test_run_monitor_inherited_lock_fd(self):
-        args = self._parse(["run-monitor", "--lock-fd", "9"])
+        args = self._parse(["run-monitor", "--lock-fd", "9", "--generation", "abc123"])
         assert args.lock_fd == 9
+        assert args.generation == "abc123"
 
     # ── 引数なし → エラー ──────────────────────────────────────────────
     def test_no_subcommand_exits(self):
@@ -122,8 +123,8 @@ class TestMainDispatch:
 
     def test_run_monitor_dispatches_inherited_lock_fd(self, mocker):
         mock = mocker.patch("kosu_tracker.cli.monitor_loop")
-        main(["run-monitor", "--interval", "10", "--lock-fd", "9"])
-        mock.assert_called_once_with(interval_seconds=10, lock_fd=9)
+        main(["run-monitor", "--interval", "10", "--lock-fd", "9", "--generation", "abc123"])
+        mock.assert_called_once_with(interval_seconds=10, lock_fd=9, generation="abc123")
 
     def test_report_dispatches_to_report_day(self, mocker):
         mock = mocker.patch("kosu_tracker.cli.report_day")
