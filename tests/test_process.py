@@ -89,6 +89,34 @@ class TestMonitorLock:
         assert second is not None
         cli_module.release_monitor_lock(second)
 
+    def test_shared_status_locks_do_not_block_each_other(self):
+        first = cli_module.try_acquire_monitor_lock(shared=True)
+        second = cli_module.try_acquire_monitor_lock(shared=True)
+        assert first is not None
+        assert second is not None
+        try:
+            assert cli_module.try_acquire_monitor_lock() is None
+        finally:
+            cli_module.release_monitor_lock(second)
+            cli_module.release_monitor_lock(first)
+
+    def test_monitor_retries_transient_shared_lock(self, mocker):
+        lock = mocker.MagicMock()
+        acquire = mocker.patch(
+            "kosu_tracker.cli.try_acquire_monitor_lock",
+            side_effect=[None, lock],
+        )
+        sleep = mocker.patch("kosu_tracker.cli.time.sleep")
+        mocker.patch("kosu_tracker.cli.signal.signal")
+        mocker.patch("kosu_tracker.cli.stop_requested", return_value=True)
+        release = mocker.patch("kosu_tracker.cli.release_monitor_lock")
+
+        cli_module.monitor_loop(1)
+
+        assert acquire.call_count == 2
+        sleep.assert_called_once_with(0.05)
+        release.assert_called_once_with(lock)
+
 
 class TestRequireNotRunning:
     def test_no_pid_file_passes_without_error(self):

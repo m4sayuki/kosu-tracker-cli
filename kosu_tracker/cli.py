@@ -213,7 +213,12 @@ def monitor_loop(interval_seconds: int) -> None:
         raise SystemExit("monitor interval must be greater than 0")
 
     ensure_dirs()
-    lock = try_acquire_monitor_lock()
+    lock = None
+    for _ in range(20):
+        lock = try_acquire_monitor_lock()
+        if lock is not None:
+            break
+        time.sleep(0.05)
     if lock is None:
         raise SystemExit("monitor is already running")
 
@@ -255,11 +260,12 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
-def try_acquire_monitor_lock() -> Any | None:
+def try_acquire_monitor_lock(shared: bool = False) -> Any | None:
     ensure_dirs()
     try:
         lock = LOCK_FILE.open("a+", encoding="utf-8")
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
         if "lock" in locals():
             lock.close()
@@ -325,7 +331,7 @@ def clear_stop_request(token: str | None = None) -> None:
 
 
 def monitor_is_running() -> bool:
-    lock = try_acquire_monitor_lock()
+    lock = try_acquire_monitor_lock(shared=True)
     if lock is None:
         return True
     release_monitor_lock(lock)
@@ -333,7 +339,7 @@ def monitor_is_running() -> bool:
 
 
 def require_not_running() -> None:
-    lock = try_acquire_monitor_lock()
+    lock = try_acquire_monitor_lock(shared=True)
     if lock is None:
         pid = read_pid()
         raise SystemExit(f"monitor is already running (pid={pid})")
@@ -371,7 +377,7 @@ def start_monitor(interval_seconds: int) -> None:
 def stop_monitor() -> None:
     state = read_monitor_state()
     if not state or not state[1] or not monitor_is_running():
-        lock = try_acquire_monitor_lock()
+        lock = try_acquire_monitor_lock(shared=True)
         if lock is not None:
             try:
                 PID_FILE.unlink(missing_ok=True)
@@ -391,7 +397,7 @@ def stop_monitor() -> None:
     else:
         raise SystemExit(f"failed to stop monitor (pid={pid})")
 
-    cleanup_lock = try_acquire_monitor_lock()
+    cleanup_lock = try_acquire_monitor_lock(shared=True)
     if cleanup_lock is not None:
         try:
             unlink_monitor_state_if_matches(pid, token)
