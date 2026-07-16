@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -21,6 +23,10 @@ APP_DIR = Path(os.environ.get("KOSU_TRACKER_HOME", Path.home() / ".local" / "sha
 LOG_DIR = APP_DIR / "logs"
 STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
+LOCK_FILE = STATE_DIR / "monitor.lock"
+CONTROL_LOCK_FILE = STATE_DIR / "control.lock"
+GENERATION_FILE = STATE_DIR / "monitor.generation"
+STOP_FILE = STATE_DIR / "monitor.stop"
 LATEST_FILE = STATE_DIR / "latest.json"
 KNOWN_BROWSERS = {
     "Google Chrome",
@@ -204,29 +210,68 @@ def collect_sample() -> ActivitySample:
     )
 
 
-def monitor_loop(interval_seconds: int) -> None:
+def monitor_loop(
+    interval_seconds: int,
+    lock_fd: int | None = None,
+    generation: str | None = None,
+) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("monitor interval must be greater than 0")
+
     ensure_dirs()
-    PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+    control_lock = acquire_control_lock()
+    if lock_fd is None:
+        lock = try_acquire_monitor_lock()
+        if lock is None:
+            release_monitor_lock(control_lock)
+            raise SystemExit("monitor is already running")
+        generation = advance_generation()
+    else:
+        try:
+            lock = os.fdopen(lock_fd, "a+", encoding="utf-8")
+        except OSError as exc:
+            release_monitor_lock(control_lock)
+            raise SystemExit("invalid inherited monitor lock") from exc
+
+    pid = os.getpid()
+    token = secrets.token_hex(16)
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
         nonlocal keep_running
         keep_running = False
 
-    signal.signal(signal.SIGTERM, handle_term)
-    signal.signal(signal.SIGINT, handle_term)
     try:
-        while keep_running:
+        if generation is None or read_generation() != generation:
+            raise SystemExit("monitor start request is no longer current")
+        clear_stop_request()
+        write_monitor_state(pid, token)
+        if control_lock is not None:
+            release_monitor_lock(control_lock)
+            control_lock = None
+
+        signal.signal(signal.SIGTERM, handle_term)
+        signal.signal(signal.SIGINT, handle_term)
+        while keep_running and not stop_requested(token):
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
             write_latest(sample)
-            time.sleep(interval_seconds)
+            remaining = float(interval_seconds)
+            while keep_running and remaining > 0 and not stop_requested(token):
+                nap = min(0.2, remaining)
+                time.sleep(nap)
+                remaining -= nap
     finally:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+        unlink_monitor_state_if_matches(pid, token)
+        clear_stop_request(token)
+        if control_lock is not None:
+            release_monitor_lock(control_lock)
+        release_monitor_lock(lock)
 
 
 def is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -234,70 +279,248 @@ def is_pid_running(pid: int) -> bool:
     return True
 
 
-def read_pid() -> int | None:
+def try_acquire_monitor_lock(shared: bool = False) -> Any | None:
+    ensure_dirs()
+    try:
+        lock = LOCK_FILE.open("a+", encoding="utf-8")
+        operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        if "lock" in locals():
+            lock.close()
+        return None
+    return lock
+
+
+def release_monitor_lock(lock: Any) -> None:
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock.close()
+
+
+def acquire_control_lock() -> Any:
+    ensure_dirs()
+    lock = CONTROL_LOCK_FILE.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        lock.close()
+        raise
+    return lock
+
+
+def read_generation() -> str | None:
+    try:
+        generation = GENERATION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return generation or None
+
+
+def advance_generation() -> str:
+    generation = secrets.token_hex(16)
+    temporary = GENERATION_FILE.with_name(f".{GENERATION_FILE.name}.{os.getpid()}")
+    temporary.write_text(f"{generation}\n", encoding="utf-8")
+    os.replace(temporary, GENERATION_FILE)
+    return generation
+
+
+def read_monitor_state() -> tuple[int, str | None] | None:
     if not PID_FILE.exists():
         return None
     try:
-        return int(PID_FILE.read_text(encoding="utf-8").strip())
-    except ValueError:
+        parts = PID_FILE.read_text(encoding="utf-8").split()
+        pid = int(parts[0])
+    except (IndexError, OSError, ValueError):
         return None
+    if pid <= 0:
+        return None
+    token = parts[1] if len(parts) == 2 else None
+    return pid, token
+
+
+def read_pid() -> int | None:
+    state = read_monitor_state()
+    return state[0] if state else None
+
+
+def write_monitor_state(pid: int, token: str) -> None:
+    temporary = PID_FILE.with_name(f".{PID_FILE.name}.{pid}")
+    temporary.write_text(f"{pid} {token}\n", encoding="utf-8")
+    os.replace(temporary, PID_FILE)
+
+
+def unlink_monitor_state_if_matches(pid: int, token: str) -> None:
+    if read_monitor_state() != (pid, token):
+        return
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def stop_requested(token: str) -> bool:
+    try:
+        return STOP_FILE.read_text(encoding="utf-8").strip() == token
+    except OSError:
+        return False
+
+
+def clear_stop_request(token: str | None = None) -> None:
+    if token is not None and not stop_requested(token):
+        return
+    try:
+        STOP_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def monitor_is_running() -> bool:
+    lock = try_acquire_monitor_lock(shared=True)
+    if lock is None:
+        return True
+    release_monitor_lock(lock)
+    return False
 
 
 def require_not_running() -> None:
-    pid = read_pid()
-    if pid and is_pid_running(pid):
-        raise SystemExit(f"monitor is already running (pid={pid})")
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    control_lock = acquire_control_lock()
+    try:
+        lock = try_acquire_monitor_lock(shared=True)
+        if lock is None:
+            pid = read_pid()
+            raise SystemExit(f"monitor is already running (pid={pid})")
+        try:
+            PID_FILE.unlink(missing_ok=True)
+            clear_stop_request()
+        finally:
+            release_monitor_lock(lock)
+    finally:
+        release_monitor_lock(control_lock)
 
 
 def start_monitor(interval_seconds: int) -> None:
+    if interval_seconds <= 0:
+        raise SystemExit("monitor interval must be greater than 0")
+
     ensure_dirs()
-    require_not_running()
-    env = os.environ.copy()
-    subprocess.Popen(
-        [sys.executable, "-m", "kosu_tracker.cli", "run-monitor", "--interval", str(interval_seconds)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        env=env,
-    )
-    time.sleep(1)
-    pid = read_pid()
-    if not pid:
-        raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
-    print(f"started monitor (pid={pid})")
-    print(f"log directory: {LOG_DIR}")
+    observed_generation = read_generation()
+    control_lock = acquire_control_lock()
+    monitor_lock = None
+    try:
+        if read_generation() != observed_generation:
+            raise SystemExit("start request was superseded by another monitor command")
+
+        monitor_lock = try_acquire_monitor_lock()
+        if monitor_lock is None:
+            raise SystemExit(f"monitor is already running (pid={read_pid()})")
+
+        generation = advance_generation()
+        PID_FILE.unlink(missing_ok=True)
+        clear_stop_request()
+        lock_fd = monitor_lock.fileno()
+        env = os.environ.copy()
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "kosu_tracker.cli",
+                "run-monitor",
+                "--interval",
+                str(interval_seconds),
+                "--lock-fd",
+                str(lock_fd),
+                "--generation",
+                generation,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+            pass_fds=(lock_fd,),
+        )
+        monitor_lock.close()
+        monitor_lock = None
+        release_monitor_lock(control_lock)
+        control_lock = None
+
+        time.sleep(1)
+        control_lock = acquire_control_lock()
+        state = read_monitor_state()
+        if state and state[1] and monitor_is_running():
+            pid, _ = state
+            print(f"started monitor (pid={pid})")
+            print(f"log directory: {LOG_DIR}")
+        else:
+            if read_generation() == generation:
+                advance_generation()
+            raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
+    finally:
+        if monitor_lock is not None:
+            release_monitor_lock(monitor_lock)
+        if control_lock is not None:
+            release_monitor_lock(control_lock)
 
 
-def stop_monitor() -> None:
-    pid = read_pid()
-    if not pid or not is_pid_running(pid):
-        if PID_FILE.exists():
-            PID_FILE.unlink()
+def _stop_monitor() -> None:
+    state = read_monitor_state()
+    if not state or not state[1] or not monitor_is_running():
+        lock = try_acquire_monitor_lock(shared=True)
+        if lock is not None:
+            try:
+                PID_FILE.unlink(missing_ok=True)
+                clear_stop_request()
+            finally:
+                release_monitor_lock(lock)
         raise SystemExit("monitor is not running")
-    os.kill(pid, signal.SIGTERM)
+
+    pid, token = state
+    STOP_FILE.write_text(f"{token}\n", encoding="utf-8")
+
     for _ in range(20):
-        if not is_pid_running(pid):
+        current = read_monitor_state()
+        if current != state or not monitor_is_running():
             break
         time.sleep(0.2)
-    if PID_FILE.exists():
-        PID_FILE.unlink()
+    else:
+        raise SystemExit(f"failed to stop monitor (pid={pid})")
+
+    cleanup_lock = try_acquire_monitor_lock(shared=True)
+    if cleanup_lock is not None:
+        try:
+            unlink_monitor_state_if_matches(pid, token)
+            clear_stop_request(token)
+        finally:
+            release_monitor_lock(cleanup_lock)
     print(f"stopped monitor (pid={pid})")
 
 
+def stop_monitor() -> None:
+    control_lock = acquire_control_lock()
+    try:
+        advance_generation()
+        _stop_monitor()
+    finally:
+        release_monitor_lock(control_lock)
+
+
 def print_status() -> None:
-    pid = read_pid()
-    running = bool(pid and is_pid_running(pid))
-    print(f"running: {'yes' if running else 'no'}")
-    if running:
-        print(f"pid: {pid}")
-    print(f"log directory: {LOG_DIR}")
-    if LATEST_FILE.exists():
-        latest = json.loads(LATEST_FILE.read_text(encoding="utf-8"))
-        print("latest sample:")
-        print(json.dumps(latest, ensure_ascii=False, indent=2))
+    control_lock = acquire_control_lock()
+    try:
+        pid = read_pid()
+        running = monitor_is_running()
+        print(f"running: {'yes' if running else 'no'}")
+        if running:
+            print(f"pid: {pid}")
+        print(f"log directory: {LOG_DIR}")
+        if LATEST_FILE.exists():
+            latest = json.loads(LATEST_FILE.read_text(encoding="utf-8"))
+            print("latest sample:")
+            print(json.dumps(latest, ensure_ascii=False, indent=2))
+    finally:
+        release_monitor_lock(control_lock)
 
 
 def iter_logs_for_date(target_date: date) -> list[dict[str, Any]]:
@@ -443,6 +666,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_monitor = sub.add_parser("run-monitor", help=argparse.SUPPRESS)
     run_monitor.add_argument("--interval", type=int, default=60)
+    run_monitor.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)
+    run_monitor.add_argument("--generation", help=argparse.SUPPRESS)
 
     report = sub.add_parser("report", help="Summarize one day of logs")
     report.add_argument("target_date", nargs="?", default="today", help="today, yesterday, or YYYY-MM-DD")
@@ -474,7 +699,14 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(sample, ensure_ascii=False, indent=2))
         return
     if args.command == "run-monitor":
-        monitor_loop(interval_seconds=args.interval)
+        if args.lock_fd is None:
+            monitor_loop(interval_seconds=args.interval)
+        else:
+            monitor_loop(
+                interval_seconds=args.interval,
+                lock_fd=args.lock_fd,
+                generation=args.generation,
+            )
         return
     if args.command == "report":
         report_day(
