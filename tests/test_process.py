@@ -21,6 +21,7 @@ def patch_state_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_module, "STATE_DIR", state_dir)
     monkeypatch.setattr(cli_module, "PID_FILE", pid_file)
     monkeypatch.setattr(cli_module, "LOCK_FILE", state_dir / "monitor.lock")
+    monkeypatch.setattr(cli_module, "CONTROL_LOCK_FILE", state_dir / "control.lock")
     monkeypatch.setattr(cli_module, "STOP_FILE", state_dir / "monitor.stop")
     return pid_file
 
@@ -100,33 +101,15 @@ class TestMonitorLock:
             cli_module.release_monitor_lock(second)
             cli_module.release_monitor_lock(first)
 
-    def test_monitor_retries_transient_shared_lock(self, mocker):
-        lock = mocker.MagicMock()
-        acquire = mocker.patch(
-            "kosu_tracker.cli.try_acquire_monitor_lock",
-            side_effect=[None, lock],
-        )
-        sleep = mocker.patch("kosu_tracker.cli.time.sleep")
-        mocker.patch("kosu_tracker.cli.signal.signal")
-        mocker.patch("kosu_tracker.cli.stop_requested", return_value=True)
-        release = mocker.patch("kosu_tracker.cli.release_monitor_lock")
-
-        cli_module.monitor_loop(1)
-
-        assert acquire.call_count == 2
-        sleep.assert_called_once_with(0.05)
-        release.assert_called_once_with(lock)
-
-    def test_waiting_monitor_exits_after_observing_active_instance(self, mocker):
+    def test_direct_monitor_exits_if_instance_lock_is_held(self):
         cli_module.PID_FILE.write_text("12345 token-a\n", encoding="utf-8")
-        acquire = mocker.patch("kosu_tracker.cli.try_acquire_monitor_lock", return_value=None)
-        sleep = mocker.patch("kosu_tracker.cli.time.sleep")
-
-        with pytest.raises(SystemExit, match=r"already running \(pid=12345\)"):
-            cli_module.monitor_loop(1)
-
-        acquire.assert_called_once_with()
-        sleep.assert_not_called()
+        lock = cli_module.try_acquire_monitor_lock()
+        assert lock is not None
+        try:
+            with pytest.raises(SystemExit, match="monitor is already running"):
+                cli_module.monitor_loop(1)
+        finally:
+            cli_module.release_monitor_lock(lock)
 
 
 class TestRequireNotRunning:

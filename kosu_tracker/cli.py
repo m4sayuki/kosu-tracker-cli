@@ -24,6 +24,7 @@ LOG_DIR = APP_DIR / "logs"
 STATE_DIR = APP_DIR / "state"
 PID_FILE = STATE_DIR / "monitor.pid"
 LOCK_FILE = STATE_DIR / "monitor.lock"
+CONTROL_LOCK_FILE = STATE_DIR / "control.lock"
 STOP_FILE = STATE_DIR / "monitor.stop"
 LATEST_FILE = STATE_DIR / "latest.json"
 KNOWN_BROWSERS = {
@@ -208,36 +209,41 @@ def collect_sample() -> ActivitySample:
     )
 
 
-def monitor_loop(interval_seconds: int) -> None:
+def monitor_loop(interval_seconds: int, lock_fd: int | None = None) -> None:
     if interval_seconds <= 0:
         raise SystemExit("monitor interval must be greater than 0")
 
     ensure_dirs()
-    lock = None
-    for _ in range(20):
+    control_lock = None
+    if lock_fd is None:
+        control_lock = acquire_control_lock()
         lock = try_acquire_monitor_lock()
-        if lock is not None:
-            break
-        state = read_monitor_state()
-        if state and state[1]:
-            raise SystemExit(f"monitor is already running (pid={state[0]})")
-        time.sleep(0.05)
-    if lock is None:
-        raise SystemExit("monitor is already running")
+        if lock is None:
+            release_monitor_lock(control_lock)
+            raise SystemExit("monitor is already running")
+    else:
+        try:
+            lock = os.fdopen(lock_fd, "a+", encoding="utf-8")
+        except OSError as exc:
+            raise SystemExit("invalid inherited monitor lock") from exc
 
     pid = os.getpid()
     token = secrets.token_hex(16)
-    clear_stop_request()
-    write_monitor_state(pid, token)
     keep_running = True
 
     def handle_term(signum: int, frame: Any) -> None:
         nonlocal keep_running
         keep_running = False
 
-    signal.signal(signal.SIGTERM, handle_term)
-    signal.signal(signal.SIGINT, handle_term)
     try:
+        clear_stop_request()
+        write_monitor_state(pid, token)
+        if control_lock is not None:
+            release_monitor_lock(control_lock)
+            control_lock = None
+
+        signal.signal(signal.SIGTERM, handle_term)
+        signal.signal(signal.SIGINT, handle_term)
         while keep_running and not stop_requested(token):
             sample = collect_sample().as_dict()
             write_jsonl(today_log_path(), sample)
@@ -250,6 +256,8 @@ def monitor_loop(interval_seconds: int) -> None:
     finally:
         unlink_monitor_state_if_matches(pid, token)
         clear_stop_request(token)
+        if control_lock is not None:
+            release_monitor_lock(control_lock)
         release_monitor_lock(lock)
 
 
@@ -281,6 +289,17 @@ def release_monitor_lock(lock: Any) -> None:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
     finally:
         lock.close()
+
+
+def acquire_control_lock() -> Any:
+    ensure_dirs()
+    lock = CONTROL_LOCK_FILE.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    except OSError:
+        lock.close()
+        raise
+    return lock
 
 
 def read_monitor_state() -> tuple[int, str | None] | None:
@@ -342,15 +361,19 @@ def monitor_is_running() -> bool:
 
 
 def require_not_running() -> None:
-    lock = try_acquire_monitor_lock(shared=True)
-    if lock is None:
-        pid = read_pid()
-        raise SystemExit(f"monitor is already running (pid={pid})")
+    control_lock = acquire_control_lock()
     try:
-        PID_FILE.unlink(missing_ok=True)
-        clear_stop_request()
+        lock = try_acquire_monitor_lock(shared=True)
+        if lock is None:
+            pid = read_pid()
+            raise SystemExit(f"monitor is already running (pid={pid})")
+        try:
+            PID_FILE.unlink(missing_ok=True)
+            clear_stop_request()
+        finally:
+            release_monitor_lock(lock)
     finally:
-        release_monitor_lock(lock)
+        release_monitor_lock(control_lock)
 
 
 def start_monitor(interval_seconds: int) -> None:
@@ -358,26 +381,52 @@ def start_monitor(interval_seconds: int) -> None:
         raise SystemExit("monitor interval must be greater than 0")
 
     ensure_dirs()
-    require_not_running()
-    env = os.environ.copy()
-    subprocess.Popen(
-        [sys.executable, "-m", "kosu_tracker.cli", "run-monitor", "--interval", str(interval_seconds)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        env=env,
-    )
-    time.sleep(1)
-    state = read_monitor_state()
-    if not state or not state[1] or not monitor_is_running():
-        raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
-    pid, _ = state
-    print(f"started monitor (pid={pid})")
-    print(f"log directory: {LOG_DIR}")
+    control_lock = acquire_control_lock()
+    monitor_lock = None
+    try:
+        monitor_lock = try_acquire_monitor_lock()
+        if monitor_lock is None:
+            raise SystemExit(f"monitor is already running (pid={read_pid()})")
+
+        PID_FILE.unlink(missing_ok=True)
+        clear_stop_request()
+        lock_fd = monitor_lock.fileno()
+        env = os.environ.copy()
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "kosu_tracker.cli",
+                "run-monitor",
+                "--interval",
+                str(interval_seconds),
+                "--lock-fd",
+                str(lock_fd),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+            pass_fds=(lock_fd,),
+        )
+        monitor_lock.close()
+        monitor_lock = None
+
+        time.sleep(1)
+        state = read_monitor_state()
+        if not state or not state[1] or not monitor_is_running():
+            raise SystemExit("failed to start monitor; check macOS Automation/Accessibility permissions")
+        pid, _ = state
+        print(f"started monitor (pid={pid})")
+        print(f"log directory: {LOG_DIR}")
+    finally:
+        if monitor_lock is not None:
+            release_monitor_lock(monitor_lock)
+        release_monitor_lock(control_lock)
 
 
-def stop_monitor() -> None:
+def _stop_monitor() -> None:
     state = read_monitor_state()
     if not state or not state[1] or not monitor_is_running():
         lock = try_acquire_monitor_lock(shared=True)
@@ -410,17 +459,29 @@ def stop_monitor() -> None:
     print(f"stopped monitor (pid={pid})")
 
 
+def stop_monitor() -> None:
+    control_lock = acquire_control_lock()
+    try:
+        _stop_monitor()
+    finally:
+        release_monitor_lock(control_lock)
+
+
 def print_status() -> None:
-    pid = read_pid()
-    running = monitor_is_running()
-    print(f"running: {'yes' if running else 'no'}")
-    if running:
-        print(f"pid: {pid}")
-    print(f"log directory: {LOG_DIR}")
-    if LATEST_FILE.exists():
-        latest = json.loads(LATEST_FILE.read_text(encoding="utf-8"))
-        print("latest sample:")
-        print(json.dumps(latest, ensure_ascii=False, indent=2))
+    control_lock = acquire_control_lock()
+    try:
+        pid = read_pid()
+        running = monitor_is_running()
+        print(f"running: {'yes' if running else 'no'}")
+        if running:
+            print(f"pid: {pid}")
+        print(f"log directory: {LOG_DIR}")
+        if LATEST_FILE.exists():
+            latest = json.loads(LATEST_FILE.read_text(encoding="utf-8"))
+            print("latest sample:")
+            print(json.dumps(latest, ensure_ascii=False, indent=2))
+    finally:
+        release_monitor_lock(control_lock)
 
 
 def iter_logs_for_date(target_date: date) -> list[dict[str, Any]]:
@@ -566,6 +627,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_monitor = sub.add_parser("run-monitor", help=argparse.SUPPRESS)
     run_monitor.add_argument("--interval", type=int, default=60)
+    run_monitor.add_argument("--lock-fd", type=int, help=argparse.SUPPRESS)
 
     report = sub.add_parser("report", help="Summarize one day of logs")
     report.add_argument("target_date", nargs="?", default="today", help="today, yesterday, or YYYY-MM-DD")
@@ -597,7 +659,10 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(sample, ensure_ascii=False, indent=2))
         return
     if args.command == "run-monitor":
-        monitor_loop(interval_seconds=args.interval)
+        if args.lock_fd is None:
+            monitor_loop(interval_seconds=args.interval)
+        else:
+            monitor_loop(interval_seconds=args.interval, lock_fd=args.lock_fd)
         return
     if args.command == "report":
         report_day(
